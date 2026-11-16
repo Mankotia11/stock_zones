@@ -1,0 +1,2728 @@
+From 474842fefb644805655939546caea53ff8c5bff4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 09:47:36 +0000
+Subject: [PATCH] v2: zone engine, ATR-scaled bands/stops, R:R gating,
+ weekly+regime confluence, per-exchange benchmark, walk-forward backtester,
+ tests
+
+---
+ .gitignore               |   5 +
+ UPGRADE_NOTES.md         |  54 ++++
+ analysis.py              | 620 ++++++++++++++++++++++++++++-----------
+ app.py                   |  16 +
+ backtest.py              | 241 +++++++++++++++
+ context.py               | 177 +++++++++++
+ market.py                |  64 ++--
+ pytest.ini               |   3 +
+ requirements-dev.txt     |   3 +
+ static/app.js            |  58 +++-
+ tests/conftest.py        |   7 +
+ tests/synth.py           |  82 ++++++
+ tests/test_analysis.py   | 152 ++++++++++
+ tests/test_backtest.py   |  90 ++++++
+ tests/test_market_app.py |  93 ++++++
+ tests/test_zones.py      | 102 +++++++
+ zones.py                 | 340 +++++++++++++++++++++
+ 17 files changed, 1903 insertions(+), 204 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 UPGRADE_NOTES.md
+ create mode 100644 backtest.py
+ create mode 100644 context.py
+ create mode 100644 pytest.ini
+ create mode 100644 requirements-dev.txt
+ create mode 100644 tests/conftest.py
+ create mode 100644 tests/synth.py
+ create mode 100644 tests/test_analysis.py
+ create mode 100644 tests/test_backtest.py
+ create mode 100644 tests/test_market_app.py
+ create mode 100644 tests/test_zones.py
+ create mode 100644 zones.py
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..3eb988b
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++__pycache__/
++*.pyc
++.pytest_cache/
++.venv/
++watchlist.db
+diff --git a/UPGRADE_NOTES.md b/UPGRADE_NOTES.md
+new file mode 100644
+index 0000000..08196e6
+--- /dev/null
++++ b/UPGRADE_NOTES.md
+@@ -0,0 +1,54 @@
++# stock_zones v2: what changed and why
++
++## Logic gaps found, and the fix for each
++
++| Gap in v1 | v2 |
++|---|---|
++| "Support" was one swing-low price; resistance was the last swing high (which could sit *below* price and silently null the R:R) | `zones.py`: swing highs **and** lows clustered into ATR-wide zones with touches, recency, volume, role-reversal. Support and resistance are both zones. |
++| Buy band / stop were fixed percentages (`support*0.992`, `*0.97`) regardless of volatility | Band = zone edges; stop = zone low minus 0.6 ATR (min 1%); "near a MA" scales with ATR% |
++| No reward side: R:R used the last swing high | Target 1/2 = next *significant* supply zones; blue-sky falls back to a projected 2.5 ATR target and says so |
++| Score could be "buy grade" with no defined entry/stop or poor R:R | Gates: no zone -> capped at Watch; R:R < 1 -> Watch; strong buy needs R:R >= 1.5 |
++| 3-bar fractal pivots drove structure, divergence and Fib (noise on any wiggle; ties produced duplicate pivots) | ATR zig-zag swings (>= 2.5 ATR and >= 3%); live break of the last swing counts so structure doesn't lag; plateau ties deduped |
++| RSI divergence accepted any two lows 7 bars apart | Needs 5-90 bars gap, lower low >= 0.25 ATR, RSI +2 pts, low still intact. Bearish divergence now also detected |
++| Zone seeds from raw fractals created fake "support" inside steep one-way moves | Reaction filter: a touch only counts if price reversed >= 1.5 ATR within 10 bars |
++| Benchmark was always Nifty, even for AAPL | Per-exchange benchmark (^NSEI, ^GSPC, ^FTSE, ...) and index regime (bull/neutral/bear) |
++| Partial-bar drop used IST 15:35 for every market | Per-exchange session close + timezone |
++| Failed/empty download cached for 15 min; cache ignored `period` | Failures retry after 60 s; cache keyed by (ticker, period) |
++| No higher-timeframe view | Weekly trend (30-week MA + slope, weekly RSI) feeds trend score and the Quality-pullback gate |
++| No liquidity check (circuit-locked / thin smallcaps) | ADV traded value + zero-range-day check -> flag, score penalty |
++| No price-action confirmation | Rejection wick / bullish engulfing / reclaim-after-sweep at the zone |
++| Missing setups | **Breakout retest** (old resistance as support); **support failed** -> Breakdown; Reversal now requires a level to reverse from |
++| Stale data silently scored | > 10 calendar days old -> Neutral with a warning |
++| Weights were guesses with no way to check them | `backtest.py` (below) |
++
++## New output fields (all additive; old keys unchanged)
++`zones{support,resistance}`, `support_zone`, `targets{entry_ref,target_1,target_2,source}`, `risk_pct`,
++`size_pct_for_1pct_risk`, `weekly`, `regime`, `liquidity`, `candles`, `benchmark`, `stale_days`,
++`scores.risk` (5th sub-score; weights now 28/24/20/12/16), `technicals.{atr, rs_60, rs_line_up, rsi_bear_divergence}`.
++`chart.zones` feeds zone bands, buy band, stop and target lines on the chart.
++
++## Validate the score on real data (needs network)
++```
++python backtest.py RELIANCE TCS HDFCBANK INFY --period 7y --step 3
++GET /api/backtest/RELIANCE?period=5y&step=5
++```
++Each sampled date is analysed with data up to that date only, entry = next bar's open. Reports forward returns,
++worst drawdown, stop/target first-touch and mean R by zone, setup and score bucket, vs an all-dates baseline.
++Look at `edge_vs_all_20d` and `mean_R`, and ignore rows marked `low n`. A hand-picked watchlist is survivorship-biased;
++for a fair read use a broad index constituent list.
++
++**Null test (synthetic random walks, no real edge exists; 36 series, ~5,300 samples):** the 20-day edge of buy
++signals vs the all-dates baseline stayed between -0.33 and +0.08 pts, and mean R was ~0 at zero drift. So the harness
++does not invent edge. `tests/test_backtest.py` also proves decisions are causal (scrambling every bar after date T
++changes nothing decided before T). None of this says the score works on real markets; run it on real data for that.
++
++## Tuning knobs
++`zones.py`: `REACTION_ATR`, `ZIGZAG_ATR_MULT`, `RECENCY_HALF_LIFE`. `analysis.py`: score weights, `STALE_DAYS`.
++`context.py`: liquidity thresholds per region. Change one at a time and re-run the backtest.
++
++## Tests
++`pip install -r requirements-dev.txt && pytest` (39 tests, offline, ~8 s).
++
++## Housekeeping
++`.gitignore` added. `watchlist.db` and `__pycache__/` were committed in v1; to stop tracking them without deleting
++your local copies: `git rm -r --cached __pycache__ watchlist.db`.
+diff --git a/analysis.py b/analysis.py
+index 8fd8c01..87ffa66 100644
+--- a/analysis.py
++++ b/analysis.py
+@@ -1,14 +1,43 @@
+ #!/usr/bin/env python3
+-"""Technical + context analysis for the stock tracker dashboard."""
++"""Technical + context analysis for the stock tracker dashboard.
++
++v2 changes (see UPGRADE_NOTES.md): zone-based support/resistance, ATR-scaled
++bands and stops, R:R gating, weekly + index-regime confluence, liquidity flag,
++candle confirmation, quality-filtered divergence, per-exchange benchmark and
++session handling.
++"""
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime, timedelta, timezone
++from datetime import date, datetime, timedelta, timezone
+ from typing import Any, Optional
+ 
+ import numpy as np
+ import pandas as pd
+ 
++from context import (
++    benchmark_for,
++    benchmark_name,
++    liquidity_info,
++    market_regime,
++    market_today,
++    region_of,
++    session_is_open_for_bar,
++    weekly_context,
++)
++from zones import (
++    ZIGZAG_ATR_MULT,
++    atr_last,
++    breakout_retest,
++    candle_signals,
++    find_zones,
++    pick_resistances,
++    pick_support,
++    pivot_idx as _pivot_idx,
++    recent_breakdown,
++    zigzag,
++)
++
+ try:
+     from zoneinfo import ZoneInfo
+ 
+@@ -18,15 +47,15 @@ except Exception:  # no tzdata (e.g. Windows) -> fixed offset, India has no DST
+ 
+ MIN_BARS = 80  # minimum to analyse at all
+ FULL_HISTORY_BARS = 220  # needed for SMA200 + its slope
+-BENCHMARK = "^NSEI"
+-
+-PIVOT_ORDER = 3  # bars either side to confirm a swing point
+-PIVOT_LOOKBACK = 120  # ignore pivots older than this
+-RECENT_PIVOT_BARS = 45  # latest pivot must be this fresh to count as "current"
+-SUPPORT_LOOKBACK = 250
++BENCHMARK = "^NSEI"  # default (Indian) benchmark; see context.benchmark_for()
++PIVOT_ORDER = 3
++RECENT_PIVOT_BARS = 90  # latest zig-zag pivot must be this fresh to define structure
++STALE_DAYS = 10  # last bar older than this (calendar days) -> data is stale
+ 
+ OHLCV_FIELDS = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+ 
++BUY_ZONES = ("strong_buy_zone", "buy_zone")
++
+ 
+ # --------------------------------------------------------------------------
+ # Ticker helpers
+@@ -77,7 +106,13 @@ def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+     return result.loc[:, ~result.columns.duplicated()]
+ 
+ 
+-def clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
++def clean_ohlcv(df: pd.DataFrame, ticker: Optional[str] = None, drop_partial: bool = True) -> pd.DataFrame:
++    """Normalise a yfinance frame.
++
++    drop_partial removes today's bar while that exchange's session is still
++    open (it is incomplete). The session is looked up per ticker (NSE/BSE,
++    NYSE/Nasdaq, LSE, ...); with no ticker the legacy NSE rule applies.
++    """
+     if df is None or df.empty:
+         return pd.DataFrame()
+     df = flatten_columns(df.copy())
+@@ -90,18 +125,29 @@ def clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+         df[c] = pd.to_numeric(df[c], errors="coerce")
+     df = df.dropna(subset=["Close"]).sort_index()
+     df = df[~df.index.duplicated(keep="last")]  # yfinance sometimes repeats the last bar
+-
+-    # Drop today's bar while the NSE session is still open (it is incomplete).
+-    if len(df):
+-        now = datetime.now(IST)
+-        last_ts = pd.Timestamp(df.index[-1])
+-        if last_ts.tzinfo is not None:
+-            last_ts = last_ts.tz_convert(IST)
+-        if last_ts.date() == now.date() and (now.hour, now.minute) < (15, 35):
++    # Rare bad prints: missing Open, or O/C outside the High-Low range.
++    df["Open"] = df["Open"].fillna(df["Close"])
++    df["High"] = df[["High", "Open", "Close"]].max(axis=1)
++    df["Low"] = df[["Low", "Open", "Close"]].min(axis=1)
++
++    if drop_partial and len(df):
++        region = region_of(ticker) if ticker else "IN"
++        if session_is_open_for_bar(df.index[-1], region):
+             df = df.iloc[:-1]
+     return df
+ 
+ 
++def _naive_daily(df: pd.DataFrame) -> pd.DataFrame:
++    """Copy with a tz-naive, midnight-normalised index so two series from
++    different venues/tz conventions can be aligned by calendar date."""
++    out = df.copy()
++    idx = pd.DatetimeIndex(out.index)
++    if idx.tz is not None:
++        idx = idx.tz_localize(None)
++    out.index = idx.normalize()
++    return out[~out.index.duplicated(keep="last")]
++
++
+ def _wilder(series: pd.Series, period: int) -> pd.Series:
+     return series.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+ 
+@@ -116,24 +162,8 @@ def _safe(val, default=None):
+         return default
+ 
+ 
+-# --------------------------------------------------------------------------
+-# Pivots (vectorised, confirmed only)
+-# --------------------------------------------------------------------------
+-def _pivot_idx(series: pd.Series, order: int = PIVOT_ORDER, mode: str = "low") -> np.ndarray:
+-    """Positional indices of confirmed swing lows/highs.
+-
+-    A centred rolling window is NaN for the last `order` bars, so unconfirmed
+-    pivots at the right edge are excluded automatically.
+-    """
+-    win = 2 * order + 1
+-    roll = series.rolling(win, center=True)
+-    ext = roll.min() if mode == "low" else roll.max()
+-    mask = (series == ext) & ext.notna()
+-    return np.flatnonzero(mask.to_numpy())
+-
+-
+ def swing_points(series: pd.Series, order: int = 3) -> list[int]:
+-    """Backward-compatible helper: all confirmed swing highs and lows, sorted."""
++    """Backward-compatible helper: all confirmed fractal swing highs and lows, sorted."""
+     idx = np.union1d(_pivot_idx(series, order, "low"), _pivot_idx(series, order, "high"))
+     return [int(i) for i in idx]
+ 
+@@ -222,12 +252,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+ 
+ 
+ # --------------------------------------------------------------------------
+-# Structure, support, fibonacci
++# Structure + fibonacci
+ # --------------------------------------------------------------------------
+ def _fib_zone(
+     price: float,
+-    swing_low: float,
+-    swing_high: float,
++    swing_low: Optional[float],
++    swing_high: Optional[float],
+     low_idx: Optional[int] = None,
+     high_idx: Optional[int] = None,
+ ) -> dict[str, Any]:
+@@ -255,65 +285,82 @@ def _fib_zone(
+     }
+ 
+ 
+-def _nearest_support(df: pd.DataFrame, price: float) -> Optional[float]:
+-    """Highest recent swing low at/below price, or None if price is at fresh lows."""
+-    n = len(df)
+-    start = max(0, n - SUPPORT_LOOKBACK)
+-    lows = df["Low"]
+-    idx = _pivot_idx(lows, PIVOT_ORDER, "low")
+-    idx = idx[idx >= start]
+-    candidates = [float(lows.iloc[i]) for i in idx]
+-    below = [x for x in candidates if x <= price * 1.01]
+-    if below:
+-        return max(below)
+-    # No pivot below price: fall back to the 20-day low only if it is below price.
+-    fallback = _safe(lows.rolling(20).min().iloc[-1])
+-    if fallback is not None and fallback <= price:
+-        return fallback
+-    return None
+-
+-
+-def _structure(df: pd.DataFrame) -> dict[str, Any]:
+-    n = len(df)
+-    hv = df["High"].to_numpy()
+-    lv = df["Low"].to_numpy()
+-    cutoff = n - PIVOT_LOOKBACK
+-
+-    hi_idx = _pivot_idx(df["High"], PIVOT_ORDER, "high")
+-    lo_idx = _pivot_idx(df["Low"], PIVOT_ORDER, "low")
+-    hi_idx = hi_idx[hi_idx >= cutoff]
+-    lo_idx = lo_idx[lo_idx >= cutoff]
+-
+-    recent_high = len(hi_idx) >= 1 and (n - 1 - hi_idx[-1]) <= RECENT_PIVOT_BARS
+-    recent_low = len(lo_idx) >= 1 and (n - 1 - lo_idx[-1]) <= RECENT_PIVOT_BARS
+-
+-    hh = len(hi_idx) >= 2 and recent_high and hv[hi_idx[-1]] > hv[hi_idx[-2]]
+-    lh = len(hi_idx) >= 2 and recent_high and hv[hi_idx[-1]] < hv[hi_idx[-2]]
+-    hl = len(lo_idx) >= 2 and recent_low and lv[lo_idx[-1]] > lv[lo_idx[-2]]
+-    ll = len(lo_idx) >= 2 and recent_low and lv[lo_idx[-1]] < lv[lo_idx[-2]]
++def _structure(df: pd.DataFrame, price: float, atr: float) -> dict[str, Any]:
++    """Market structure from ATR zig-zag swings (not 3-bar fractals).
+ 
++    Only moves large enough to matter (>= ZIGZAG_ATR_MULT ATR) count as swings,
++    which removes the noise that made HH/HL/LH/LL labels flip on tiny wiggles.
++    A live break of the last swing counts, so structure does not lag.
++    """
++    n = len(df)
++    piv = zigzag(
++        df["High"].to_numpy(dtype=float),
++        df["Low"].to_numpy(dtype=float),
++        df["Close"].to_numpy(dtype=float),
++        df["ATR"].to_numpy(dtype=float),
++    )
++    highs = [p for p in piv if p["t"] == "H"]
++    lows = [p for p in piv if p["t"] == "L"]
++
++    def fresh(p) -> bool:
++        return (n - 1 - p["i"]) <= RECENT_PIVOT_BARS
++
++    hh = len(highs) >= 2 and fresh(highs[-1]) and highs[-1]["p"] > highs[-2]["p"]
++    lh = len(highs) >= 2 and fresh(highs[-1]) and highs[-1]["p"] < highs[-2]["p"]
++    hl = len(lows) >= 2 and fresh(lows[-1]) and lows[-1]["p"] > lows[-2]["p"]
++    ll = len(lows) >= 2 and fresh(lows[-1]) and lows[-1]["p"] < lows[-2]["p"]
++    if len(highs) >= 2 and fresh(highs[-1]) and price > max(highs[-1]["p"], highs[-2]["p"]):
++        hh, lh = True, False  # live break above both prior swing highs
++    if len(lows) >= 2 and fresh(lows[-1]) and price < min(lows[-1]["p"], lows[-2]["p"]):
++        ll, hl = True, False
++
++    rsi = df["RSI"].to_numpy(dtype=float)
++    atr_arr = df["ATR"].to_numpy(dtype=float)
++
++    # Bullish divergence: a real lower low (>= 0.25 ATR) with RSI >= 2 pts higher,
++    # swings 5-90 bars apart, still intact (price has not undercut the 2nd low).
+     rsi_div = False
+-    if len(lo_idx) >= 2 and recent_low and "RSI" in df.columns:
+-        i1, i2 = lo_idx[-2], lo_idx[-1]
+-        r1, r2 = float(df["RSI"].iloc[i1]), float(df["RSI"].iloc[i2])
+-        rsi_div = bool(
+-            lv[i2] < lv[i1] and np.isfinite(r1) and np.isfinite(r2) and r2 > r1
+-        )
+-
+-    window = 60
+-    tail = df.iloc[-window:]
+-    if len(hi_idx):
+-        high_i = int(hi_idx[-1])
+-        last_high = float(hv[high_i])
+-    else:
+-        high_i = n - len(tail) + int(np.argmax(tail["High"].to_numpy()))
+-        last_high = float(tail["High"].max())
+-    if len(lo_idx):
+-        low_i = int(lo_idx[-1])
+-        last_low = float(lv[low_i])
+-    else:
+-        low_i = n - len(tail) + int(np.argmin(tail["Low"].to_numpy()))
+-        last_low = float(tail["Low"].min())
++    if len(lows) >= 2 and (n - 1 - lows[-1]["i"]) <= 40:
++        a, b = lows[-2], lows[-1]
++        gap = b["i"] - a["i"]
++        a_atr = atr_arr[b["i"]] if np.isfinite(atr_arr[b["i"]]) else atr
++        if (
++            5 <= gap <= 90
++            and b["p"] < a["p"] - 0.25 * a_atr
++            and np.isfinite(rsi[a["i"]])
++            and np.isfinite(rsi[b["i"]])
++            and rsi[b["i"]] > rsi[a["i"]] + 2
++            and price > b["p"]
++        ):
++            rsi_div = True
++
++    # Bearish divergence: higher high with RSI lower (distribution warning).
++    rsi_bear_div = False
++    if len(highs) >= 2 and (n - 1 - highs[-1]["i"]) <= 40:
++        a, b = highs[-2], highs[-1]
++        gap = b["i"] - a["i"]
++        a_atr = atr_arr[b["i"]] if np.isfinite(atr_arr[b["i"]]) else atr
++        if (
++            5 <= gap <= 90
++            and b["p"] > a["p"] + 0.25 * a_atr
++            and np.isfinite(rsi[a["i"]])
++            and np.isfinite(rsi[b["i"]])
++            and rsi[b["i"]] < rsi[a["i"]] - 2
++        ):
++            rsi_bear_div = True
++
++    tail = df.iloc[-60:]
++    last_high = float(highs[-1]["p"]) if highs else float(tail["High"].max())
++    last_low = float(lows[-1]["p"]) if lows else float(tail["Low"].min())
++
++    # Most recent completed up-leg for retracement maths: last swing high and
++    # the swing low just before it. Must span >= 3 ATR to be a meaningful leg.
++    leg = None
++    if highs:
++        H = highs[-1]
++        prior = [p for p in lows if p["i"] < H["i"]]
++        if prior and (H["p"] - prior[-1]["p"]) >= 3 * atr:
++            leg = (prior[-1]["p"], H["p"], prior[-1]["i"], H["i"])
+ 
+     label = "range"
+     if hh and hl:
+@@ -331,11 +378,12 @@ def _structure(df: pd.DataFrame) -> dict[str, Any]:
+         "lh": bool(lh),
+         "ll": bool(ll),
+         "rsi_div": bool(rsi_div),
++        "rsi_bear_div": bool(rsi_bear_div),
+         "label": label,
+         "last_swing_high": last_high,
+         "last_swing_low": last_low,
+-        "high_idx": high_i,
+-        "low_idx": low_i,
++        "leg": leg,
++        "n_swings": len(piv),
+     }
+ 
+ 
+@@ -343,12 +391,12 @@ def _today_ist():
+     return datetime.now(IST).date()
+ 
+ 
+-def _earnings_soon(calendar) -> bool:
+-    """True if an earnings date falls within the next 10 days (IST)."""
++def _earnings_soon(calendar, today: Optional[date] = None) -> bool:
++    """True if an earnings date falls within the next 10 days."""
+     try:
+         if calendar is None:
+             return False
+-        today = _today_ist()
++        today = today or _today_ist()
+         dates: list = []
+         if isinstance(calendar, pd.DataFrame):
+             if calendar.empty:
+@@ -387,6 +435,27 @@ def classify_zone(score: float, setup: str) -> str:
+     return "neutral"
+ 
+ 
++def _rr_points(rr: Optional[float]) -> int:
++    if rr is None:
++        return 35
++    if rr >= 3:
++        return 90
++    if rr >= 2:
++        return 75
++    if rr >= 1.5:
++        return 60
++    if rr >= 1:
++        return 45
++    return 20
++
++
++def _zone_view(zones: list[dict], price: float, atr: float, n_each: int = 3, span: float = 0.35) -> dict[str, list]:
++    keep = [z for z in zones if abs(z["mid"] / price - 1) <= span]
++    below = sorted((z for z in keep if z["mid"] <= price), key=lambda z: -z["mid"])[:n_each]
++    above = sorted((z for z in keep if z["mid"] > price), key=lambda z: z["mid"])[:n_each]
++    return {"support": below, "resistance": above}
++
++
+ # --------------------------------------------------------------------------
+ # Main analysis
+ # --------------------------------------------------------------------------
+@@ -396,8 +465,14 @@ def analyze_frame(
+     bench: Optional[pd.DataFrame] = None,
+     info: Optional[dict] = None,
+     calendar=None,
++    *,
++    drop_partial: bool = True,
++    include_chart: bool = True,
++    now: Optional[date] = None,
+ ) -> dict[str, Any]:
+-    df = clean_ohlcv(df)
++    region = region_of(ticker)
++    bench_symbol = benchmark_for(ticker)
++    df = clean_ohlcv(df, ticker=ticker, drop_partial=drop_partial)
+     if len(df) < MIN_BARS:
+         raise ValueError(f"{ticker}: need at least {MIN_BARS} daily bars")
+     limited_history = len(df) < FULL_HISTORY_BARS
+@@ -407,6 +482,13 @@ def analyze_frame(
+     prev = df.iloc[-2]
+     prev2 = df.iloc[-3]
+     price = float(last["Close"])
++    today = now or market_today(region)
++    stale_days = (today - df.index[-1].date()).days
++    stale = stale_days > STALE_DAYS
++
++    atr = _safe(last["ATR"]) or price * 0.02
++    atr_pct = atr / price * 100
++    near_pct = float(np.clip(1.2 * atr_pct, 1.0, 5.0))  # "near a MA" scales with volatility
+ 
+     rsi = _safe(last["RSI"], 50.0)
+     rsi_prev = _safe(prev["RSI"], rsi)
+@@ -415,16 +497,45 @@ def analyze_frame(
+     macd_hist_prev = _safe(prev["MACD_hist"], 0.0)
+     macd_hist_prev2 = _safe(prev2["MACD_hist"], macd_hist_prev)
+ 
+-    struct = _structure(df)
+-    support = _nearest_support(df, price)
+-    fib = _fib_zone(
+-        price,
+-        struct["last_swing_low"],
+-        struct["last_swing_high"],
+-        struct["low_idx"],
+-        struct["high_idx"],
++    struct = _structure(df, price, atr)
++    fib = (
++        _fib_zone(price, *struct["leg"][:2], struct["leg"][2], struct["leg"][3])
++        if struct["leg"]
++        else {"in_zone": False, "level": None, "retracement": None}
+     )
+ 
++    # ---- zones: support, resistance, failed support, breakout retest -------
++    zones = find_zones(df)
++    res_list = pick_resistances(zones, price, atr)
++    sup = pick_support(zones, price, atr)
++    breakdown = recent_breakdown(df, zones, atr)
++    retest = breakout_retest(df, zones, atr)
++    if retest is not None:
++        sup = retest["zone"]  # old resistance now acting as support
++    support_failed = breakdown is not None and (sup is None or breakdown["mid"] > sup["mid"])
++    candles = candle_signals(df, sup, atr)
++    candle_confirm = candles["rejection"] or candles["engulfing"] or candles["reclaim"]
++
++    sup_gap_atr = None
++    at_support = False
++    if sup is not None:
++        sup_gap_atr = max(0.0, price - sup["high"]) / atr
++        at_support = (
++            price >= sup["low"] - 0.5 * atr
++            and price <= sup["high"] + 1.2 * atr
++            and not support_failed
++        )
++    supply_close = any(
++        z is not sup and z["strength"] >= 35 and z["mid"] > price and z["low"] - price <= 0.6 * atr
++        for z in zones
++    )
++    fib_confluence = False
++    if fib["in_zone"] and sup is not None and fib.get("prices"):
++        fib_confluence = any(
++            sup["low"] - 0.5 * atr <= fib["prices"][k] <= sup["high"] + 0.5 * atr for k in ("0.5", "0.618")
++        )
++
++    # ---- moving averages ----------------------------------------------------
+     sma20 = _safe(last["SMA20"])
+     sma50 = _safe(last["SMA50"])
+     sma200 = _safe(last["SMA200"])
+@@ -435,16 +546,14 @@ def analyze_frame(
+     # With <200 bars, SMA200 is unknown (not "bearish"): fall back to the 50-day.
+     long_trend_ok = above_200 if has_200 else above_50
+     ma_stack_bull = (
+-        sma20 is not None
+-        and sma50 is not None
+-        and has_200
+-        and sma20 > sma50 > sma200
++        sma20 is not None and sma50 is not None and has_200 and sma20 > sma50 > sma200
+     )
+ 
+     dist_20 = ((price / sma20) - 1) * 100 if sma20 else None
+     dist_50 = ((price / sma50) - 1) * 100 if sma50 else None
+     dist_200 = ((price / sma200) - 1) * 100 if sma200 else None
+-    dist_support = ((price / support) - 1) * 100 if support else None
++    ext_atr = (price - sma20) / atr if sma20 else 0.0  # stretch above the 20-day, in ATRs
++    dist_support = ((price / sup["mid"]) - 1) * 100 if sup else None
+ 
+     rel_vol = _safe(last["Rel_Vol"], 1.0)
+     cmf = _safe(last["CMF"], 0.0)
+@@ -462,47 +571,105 @@ def analyze_frame(
+     roc20 = _safe(last["ROC_20"], 0.0)
+     dd60 = _safe(last["DD_60"], 0.0)
+     pos52 = _safe(last["Pos_52w"], 0.5)
+-    atr_pct = _safe(last["ATR_pct"], 2.0)
+ 
+-    # Relative strength vs benchmark; None means "unknown", not "neutral".
++    # ---- relative strength + regime (benchmark matched to the exchange) -----
+     rs_20: Optional[float] = None
++    rs_60: Optional[float] = None
++    rs_line_up: Optional[bool] = None
++    regime = {"state": "unknown", "symbol": bench_symbol, "drawdown_pct": None}
+     if bench is not None:
+-        b = clean_ohlcv(bench)
++        b = clean_ohlcv(bench, ticker=bench_symbol, drop_partial=drop_partial)
++        if len(b):
++            regime = market_regime(b, bench_symbol)
+         if len(b) >= 25:
+-            common = df.index.intersection(b.index)
++            sn, bn = _naive_daily(df), _naive_daily(b)
++            common = sn.index.intersection(bn.index)
+             if len(common) >= 25:
+-                s = df.loc[common, "Close"]
+-                x = b.loc[common, "Close"]
++                s = sn.loc[common, "Close"]
++                x = bn.loc[common, "Close"]
+                 rs_20 = float((s.iloc[-1] / s.iloc[-21] - 1) - (x.iloc[-1] / x.iloc[-21] - 1)) * 100
++                if len(common) >= 65:
++                    rs_60 = float((s.iloc[-1] / s.iloc[-61] - 1) - (x.iloc[-1] / x.iloc[-61] - 1)) * 100
++                if len(common) >= 60:
++                    ratio = s / x
++                    rs_line_up = bool(ratio.iloc[-1] > ratio.rolling(50).mean().iloc[-1])
++
++    weekly = weekly_context(df)
++    liq = liquidity_info(df, region)
+ 
+     # Two-bar confirmation instead of a single-bar uptick.
+     rsi_turning_up = rsi > rsi_prev > rsi_prev2 and min(rsi_prev, rsi_prev2) < 45
+     macd_turning_up = macd_hist > macd_hist_prev > macd_hist_prev2 and macd_hist_prev < 0
+     stoch_cross_up = stoch_k > stoch_d and stoch_prev_k <= stoch_prev_d
+ 
+-    near_ma = any(d is not None and abs(d) <= 2.5 for d in (dist_20, dist_50, dist_200))
+-    near_support = dist_support is not None and 0 <= dist_support <= 3.5
++    near_ma = any(d is not None and abs(d) <= near_pct for d in (dist_20, dist_50, dist_200))
+     oversold_band = 28 <= rsi <= 48
+     not_crushed = rsi >= 28 or struct["hl"] or struct["rsi_div"]
+ 
++    # ---- buy band, invalidation, targets, risk/reward (all ATR-scaled) ------
++    buy_from = buy_to = invalidation = entry_ref = target_1 = target_2 = None
++    target_src = None
++    rr = None
++    if sup is not None and not support_failed:
++        buy_from = sup["low"]
++        buy_to = sup["high"] + 0.35 * atr
++        for ma in (sma20, sma50, sma200):  # extend to a MA sitting just above the zone
++            if ma and sup["high"] < ma <= sup["high"] + 0.9 * atr:
++                buy_to = max(buy_to, ma + 0.1 * atr)
++        buy_to = min(buy_to, sup["high"] + 1.0 * atr)
++        invalidation = min(sup["low"] - 0.6 * atr, sup["low"] * 0.99)
++
++        if price > invalidation:
++            entry_ref = price if price <= buy_to else buy_to
++            # First target = next *significant* supply zone at least 1.5 ATR away,
++            # so a one-touch bump right above price does not define the reward.
++            cands = [z for z in res_list if z["low"] > entry_ref + 1.5 * atr and z["strength"] >= 40]
++            if not cands:
++                cands = [z for z in res_list if z["low"] > entry_ref + 0.5 * atr]
++            if cands:
++                target_1 = cands[0]["low"]  # conservative: front edge of supply
++                target_2 = cands[1]["low"] if len(cands) > 1 else None
++                target_src = "zone"
++            else:
++                target_1 = entry_ref + 2.5 * atr  # blue sky: no overhead zone found
++                target_src = "projected"
++            risk = entry_ref - invalidation
++            reward = target_1 - entry_ref
++            if risk > 0 and reward > 0:
++                rr = round(reward / risk, 2)
++
+     # ---- sub-scores -------------------------------------------------------
+     location = 40
+-    if near_support:
+-        location += 22
++    if at_support:
++        location += 10 + int(14 * sup["strength"] / 100)
++    if retest is not None and at_support:
++        location += 6
+     if near_ma and long_trend_ok:
+         location += 18
+     elif near_ma:
+         location += 10
+     if fib["in_zone"]:
+         location += 12
++    if fib_confluence:
++        location += 6
+     if bb_pct < 0.25:
+         location += 10
+-    if dist_20 is not None and dist_20 > 8:
++    if candle_confirm and at_support:
++        location += 10
++    if ext_atr > 3:
+         location -= 18
++    elif ext_atr > 2:
++        location -= 8
+     if pos52 > 0.92:
+         location -= 12
+-    if dist_support is not None and dist_support > 12:
++    if sup_gap_atr is not None and sup_gap_atr > 6:
+         location -= 8
++    if sup is None:
++        location -= 10
++    if supply_close:
++        location -= 10
++    if support_failed:
++        location -= 25
+     location = int(np.clip(location, 0, 100))
+ 
+     momentum = 40
+@@ -518,10 +685,14 @@ def analyze_frame(
+         momentum += 12
+     if plus_di > minus_di and adx >= 18:
+         momentum += 8
++    if candle_confirm and at_support:
++        momentum += 8
+     if rsi < 25 and not struct["hl"]:
+         momentum -= 18
+     if macd_hist < macd_hist_prev and macd_hist < 0:
+         momentum -= 8
++    if struct["rsi_bear_div"]:
++        momentum -= 12
+     momentum = int(np.clip(momentum, 0, 100))
+ 
+     trend = 40
+@@ -535,21 +706,29 @@ def analyze_frame(
+         trend += 10
+     if rs_20 is not None:
+         if rs_20 > 2:
+-            trend += 10
++            trend += 6
+         elif rs_20 < -4:
+             trend -= 12
++    if rs_60 is not None and rs_60 > 3:
++        trend += 4
++    if rs_line_up:
++        trend += 4
+     if struct["label"] == "uptrend":
+         trend += 10
+     elif struct["label"] == "downtrend":
+         trend -= 16
+     if adx < 15:
+         trend -= 4
++    if weekly["trend"] == "up":
++        trend += 10
++    elif weekly["trend"] == "down":
++        trend -= 12
+     trend = int(np.clip(trend, 0, 100))
+ 
+     volume = 45
+-    if rel_vol < 0.85 and (near_ma or near_support):
++    if rel_vol < 0.85 and (near_ma or at_support):
+         volume += 10  # quiet pullback
+-    if rel_vol > 1.4 and (rsi_turning_up or macd_turning_up):
++    if rel_vol > 1.4 and (rsi_turning_up or macd_turning_up or candle_confirm):
+         volume += 16  # demand returning
+     if cmf > 0.05:
+         volume += 10
+@@ -557,10 +736,24 @@ def analyze_frame(
+         volume -= 10
+     if _safe(last["OBV_slope"], 0) > 0:
+         volume += 8
++    if retest is not None and retest["vol_confirm"]:
++        volume += 8
+     volume = int(np.clip(volume, 0, 100))
+ 
++    risk_score = _rr_points(rr)
++    if sup is not None:
++        risk_score += int((sup["strength"] - 50) * 0.2)
++    if liq["state"] == "thin":
++        risk_score -= 8
++    elif liq["state"] in ("illiquid", "circuit_or_illiquid"):
++        risk_score -= 20
++    if atr_pct > 6:
++        risk_score -= 10
++    risk_score = int(np.clip(risk_score, 0, 100))
++
+     # ---- setup classification --------------------------------------------
+-    earnings_risk = _earnings_soon(calendar)
++    earnings_risk = _earnings_soon(calendar, today)
++    weekly_down = weekly["trend"] == "down"
+     falling_knife = (
+         not above_50
+         and (not has_200 or not above_200)
+@@ -569,13 +762,22 @@ def analyze_frame(
+         and struct["ll"]
+         and not struct["hl"]
+     )
+-    extended = dist_20 is not None and dist_20 > 7 and rsi > 65 and pos52 > 0.85
++    extended = (ext_atr > 3 or (dist_20 is not None and dist_20 > 8)) and rsi > 65 and pos52 > 0.85
+     quality_pullback = (
+         long_trend_ok
++        and not weekly_down
+         and oversold_band
+-        and (near_ma or near_support or fib["in_zone"])
+-        and (struct["hl"] or rsi_turning_up or macd_turning_up)
++        and (near_ma or at_support or fib["in_zone"])
++        and (struct["hl"] or rsi_turning_up or macd_turning_up or candle_confirm)
+         and not falling_knife
++        and not support_failed
++    )
++    breakout_retest_ok = (
++        retest is not None
++        and long_trend_ok
++        and 40 <= rsi <= 68
++        and not extended
++        and not support_failed
+     )
+     momentum_dip = (
+         above_50
+@@ -584,22 +786,28 @@ def analyze_frame(
+         and rs_20 > 1
+         and (near_ma or oversold_band)
+         and not extended
++        and not support_failed
+     )
+     reversal = (
+         (struct["rsi_div"] or (rsi_turning_up and rsi < 40))
+         and not long_trend_ok
+         and not_crushed
++        and (at_support or candles["reclaim"])  # a reversal needs a level to reverse from
+     )
+-    squeeze_break = squeeze and macd_turning_up and plus_di > minus_di
++    squeeze_break = squeeze and macd_turning_up and plus_di > minus_di and not support_failed
+ 
+     setup = "Neutral"
+     setup_mult = 1.0
+     if falling_knife:
+         setup, setup_mult = "Falling knife", 0.45
++    elif support_failed:
++        setup, setup_mult = "Breakdown", 0.5
+     elif extended:
+         setup, setup_mult = "Extended", 0.55
+     elif quality_pullback:
+         setup, setup_mult = "Quality pullback", 1.18
++    elif breakout_retest_ok:
++        setup, setup_mult = "Breakout retest", 1.15
+     elif momentum_dip:
+         setup, setup_mult = "Momentum dip", 1.08
+     elif squeeze_break:
+@@ -614,17 +822,68 @@ def analyze_frame(
+         risk_adj *= 0.9
+     if atr_pct > 5:
+         risk_adj *= 0.95
+-
+-    raw = location * 0.32 + momentum * 0.28 + trend * 0.22 + volume * 0.18
++    if regime["state"] == "bear":
++        risk_adj *= 0.92
++    if liq["state"] == "thin":
++        risk_adj *= 0.95
++    elif liq["state"] in ("illiquid", "circuit_or_illiquid"):
++        risk_adj *= 0.85
++
++    raw = (
++        location * 0.28
++        + momentum * 0.24
++        + trend * 0.20
++        + volume * 0.12
++        + risk_score * 0.16
++    )
+     score = round(float(np.clip(raw * setup_mult * risk_adj, 0, 100)), 1)
+     zone = classify_zone(score, setup)
+ 
++    # ---- actionability gates ---------------------------------------------
++    gate_note = None
++    if zone in BUY_ZONES:
++        if buy_from is None:
++            zone, gate_note = "watch", "Score is buy-grade but no demand zone defines an entry or stop - capped at Watch"
++        elif rr is not None and rr < 1.0:
++            zone, gate_note = "watch", f"Score is buy-grade but reward:risk is only {rr:.1f} - capped at Watch"
++        elif rr is not None and rr < 1.5 and zone == "strong_buy_zone":
++            zone, gate_note = "buy_zone", f"Reward:risk {rr:.1f} is below 1.5 - downgraded from strong buy"
++    if stale:
++        zone, gate_note = "neutral", f"Last bar is {stale_days} days old - data is stale, no signal"
++
++    if zone in ("avoid", "extended"):
++        buy_from = buy_to = invalidation = entry_ref = target_1 = target_2 = None
++        rr = None
++        target_src = None
++
++    risk_pct = size_pct = None
++    if invalidation is not None and entry_ref:
++        risk_pct = round((entry_ref - invalidation) / entry_ref * 100, 2)
++        if risk_pct > 0:
++            size_pct = round(min(100.0, 100.0 / risk_pct), 1)  # % of capital to risk 1% on the stop
++
+     # ---- signals ------------------------------------------------------------
+-    signals = []
++    bname = benchmark_name(ticker)
++    signals: list[str] = []
+     if quality_pullback:
+         signals.append("Healthy trend, price back into a demand area")
++    if breakout_retest_ok:
++        v = " on strong volume" if retest["vol_confirm"] else ""
++        signals.append(f"Broke out{v} {retest['bars_ago']} bars ago, now retesting the old resistance as support")
+     if momentum_dip:
+         signals.append("Shallow dip while relative strength stays positive")
++    if at_support:
++        signals.append(
++            f"At demand zone {sup['low']:.2f}-{sup['high']:.2f} "
++            f"({sup['touches']} touches, strength {sup['strength']})"
++        )
++    if candle_confirm and at_support:
++        kinds = [k for k in ("rejection", "engulfing", "reclaim") if candles[k]]
++        signals.append("Candle confirmation at the zone: " + ", ".join(kinds))
++    if weekly["trend"] == "up":
++        signals.append("Weekly trend is up: daily dip inside a rising higher-timeframe trend")
++    elif weekly_down:
++        signals.append("Weekly trend is down: bounces are counter-trend")
+     if rsi_turning_up:
+         signals.append(f"RSI rising two bars running ({rsi_prev2:.0f} -> {rsi:.0f})")
+     if macd_turning_up:
+@@ -633,45 +892,40 @@ def analyze_frame(
+         signals.append("Higher swing low in place")
+     if struct["rsi_div"]:
+         signals.append("Bullish RSI divergence at the last two swing lows")
++    if struct["rsi_bear_div"]:
++        signals.append("Bearish RSI divergence at the last two swing highs - momentum fading")
+     if fib["in_zone"]:
+-        signals.append(f"Trading in the {fib['level']} Fibonacci retracement band")
+-    if near_support:
+-        signals.append(f"Within {dist_support:.1f}% of swing support {support:.2f}")
++        extra = " (aligns with the demand zone)" if fib_confluence else ""
++        signals.append(f"Trading in the {fib['level']} Fibonacci retracement band{extra}")
+     if near_ma and long_trend_ok:
+         signals.append("Holding the moving-average cluster in a healthy trend")
+     if squeeze:
+         signals.append("Bollinger squeeze: volatility compressed, move likely soon")
+     if rs_20 is not None and rs_20 > 2:
+-        signals.append(f"Outperforming Nifty by {rs_20:.1f} pts over 20 sessions")
++        signals.append(f"Outperforming {bname} by {rs_20:.1f} pts over 20 sessions")
+     if cmf > 0.05:
+         signals.append("Chaikin money flow positive (buying pressure)")
++    if supply_close:
++        signals.append("Strong supply zone directly overhead - limited room")
++    if regime["state"] == "bear":
++        signals.append(f"{bname} is in a downtrend - broad-market headwind")
+     if earnings_risk:
+         signals.append("Earnings within 10 days - size down or wait")
++    if liq["state"] in ("thin", "illiquid", "circuit_or_illiquid"):
++        signals.append(f"Liquidity flag ({liq['state'].replace('_', ' ')}): expect slippage / gap risk")
+     if falling_knife:
+         signals.append("Declining MAs, lower lows, weak RSI - not a buy zone")
++    if support_failed:
++        signals.append(f"Support zone {breakdown['low']:.2f}-{breakdown['high']:.2f} just failed - wait for a base")
+     if extended:
+         signals.append("Stretched above the 20-day and near the top of its 52-week range - chase risk")
++    if gate_note:
++        signals.append(gate_note)
+     if limited_history:
+         signals.append(f"Under {FULL_HISTORY_BARS} bars of history: 200-day average unavailable")
+     if not signals:
+         signals.append("No strong edge: wait for a test of support or a momentum turn")
+ 
+-    # ---- buy band / invalidation / risk-reward ----------------------------
+-    buy_from = buy_to = invalidation = None
+-    if support and zone not in ("avoid", "extended"):
+-        ceilings = [support * 1.035]
+-        for ma in (sma20, sma50, sma200):
+-            if ma and ma >= support and (ma - support) / support <= 0.06:
+-                ceilings.append(ma * 1.008)
+-        buy_from = round(support * 0.992, 2)
+-        buy_to = round(min(ceilings), 2)
+-        invalidation = round(support * 0.97, 2)
+-
+-    resistance = struct["last_swing_high"]
+-    risk_reward = None
+-    if invalidation is not None and resistance > price > invalidation:
+-        risk_reward = round((resistance - price) / (price - invalidation), 2)
+-
+     change_1d = float(df["Close"].pct_change().iloc[-1] * 100)
+ 
+     name = info.get("shortName") or info.get("longName") or ticker.replace(".NS", "")
+@@ -680,9 +934,10 @@ def analyze_frame(
+     mcap = _safe(info.get("marketCap"))
+     beta = _safe(info.get("beta"))
+ 
+-    chart = _chart_payload(df.tail(180))
++    zone_view = _zone_view(zones, price, atr)
++    resistance = res_list[0]["low"] if res_list else struct["last_swing_high"]
+ 
+-    return {
++    result = {
+         "ticker": ticker,
+         "symbol": ticker.replace(".NS", "").replace(".BO", ""),
+         "name": name,
+@@ -693,20 +948,30 @@ def analyze_frame(
+         "buy_score": score,
+         "zone": zone,
+         "setup": setup,
+-        "signals": signals[:8],
+-        "buy_from": buy_from,
+-        "buy_to": buy_to,
+-        "invalidation": invalidation,
+-        "support": round(support, 2) if support else None,
+-        "resistance": round(resistance, 2),
+-        "risk_reward": risk_reward,
++        "signals": signals[:10],
++        "buy_from": round(buy_from, 2) if buy_from is not None else None,
++        "buy_to": round(buy_to, 2) if buy_to is not None else None,
++        "invalidation": round(invalidation, 2) if invalidation is not None else None,
++        "support": round(sup["mid"], 2) if sup else None,
++        "resistance": round(float(resistance), 2),
++        "targets": {
++            "entry_ref": round(entry_ref, 2) if entry_ref is not None else None,
++            "target_1": round(target_1, 2) if target_1 is not None else None,
++            "target_2": round(target_2, 2) if target_2 is not None else None,
++            "source": target_src,
++        },
++        "risk_reward": rr,
++        "risk_pct": risk_pct,
++        "size_pct_for_1pct_risk": size_pct,
+         "in_buy_band": bool(buy_from and buy_to and buy_from <= price <= buy_to),
+         "limited_history": limited_history,
++        "stale_days": stale_days,
+         "scores": {
+             "location": location,
+             "momentum": momentum,
+             "trend": trend,
+             "volume": volume,
++            "risk": risk_score,
+         },
+         "technicals": {
+             "rsi": round(rsi, 1),
+@@ -720,6 +985,7 @@ def analyze_frame(
+             "rel_vol": round(rel_vol, 2),
+             "cmf": round(cmf, 3),
+             "bb_pct": round(bb_pct, 2),
++            "atr": round(atr, 2),
+             "atr_pct": round(atr_pct, 2),
+             "sma20": round(sma20, 2) if sma20 else None,
+             "sma50": round(sma50, 2) if sma50 else None,
+@@ -730,10 +996,13 @@ def analyze_frame(
+             "dd_60": round(dd60, 1),
+             "pos_52w": round(pos52 * 100, 1),
+             "rs_20": round(rs_20, 2) if rs_20 is not None else None,
++            "rs_60": round(rs_60, 2) if rs_60 is not None else None,
++            "rs_line_up": rs_line_up,
+             "structure": struct["label"],
+             "higher_low": struct["hl"],
+             "higher_high": struct["hh"],
+             "rsi_divergence": struct["rsi_div"],
++            "rsi_bear_divergence": struct["rsi_bear_div"],
+             "squeeze": bool(squeeze),
+             "above_200dma": bool(above_200),
+             "ma_stack_bull": bool(ma_stack_bull),
+@@ -744,13 +1013,22 @@ def analyze_frame(
+             "beta": round(beta, 2) if beta else None,
+             "earnings_soon": earnings_risk,
+         },
++        "benchmark": {"symbol": bench_symbol, "name": bname},
++        "weekly": weekly,
++        "regime": regime,
++        "liquidity": liq,
++        "candles": candles,
++        "zones": zone_view,
++        "support_zone": sup,
+         "fib": fib,
+         "as_of": str(df.index[-1].date()),
+-        "chart": chart,
+     }
++    if include_chart:
++        result["chart"] = _chart_payload(df.tail(180), zone_view)
++    return result
+ 
+ 
+-def _chart_payload(df: pd.DataFrame) -> dict[str, Any]:
++def _chart_payload(df: pd.DataFrame, zone_view: Optional[dict] = None) -> dict[str, Any]:
+     dates = [str(i.date()) for i in df.index]
+ 
+     def series(col):
+@@ -758,6 +1036,11 @@ def _chart_payload(df: pd.DataFrame) -> dict[str, Any]:
+             return []
+         return [None if pd.isna(x) else round(float(x), 2) for x in df[col].tolist()]
+ 
++    zl = []
++    for role in ("support", "resistance"):
++        for z in (zone_view or {}).get(role, []):
++            zl.append({"low": z["low"], "high": z["high"], "role": role, "strength": z["strength"]})
++
+     return {
+         "dates": dates,
+         "open": series("Open"),
+@@ -772,6 +1055,7 @@ def _chart_payload(df: pd.DataFrame) -> dict[str, Any]:
+         "macd_hist": [
+             None if pd.isna(x) else round(float(x), 4) for x in df["MACD_hist"].tolist()
+         ],
++        "zones": zl,
+     }
+ 
+ 
+@@ -782,4 +1066,4 @@ def empty_error(ticker: str, message: str) -> dict[str, Any]:
+         "error": message,
+         "buy_score": None,
+         "zone": "error",
+-    }
+\ No newline at end of file
++    }
+diff --git a/app.py b/app.py
+index 2902baf..a3adbe1 100644
+--- a/app.py
++++ b/app.py
+@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
+ from pydantic import BaseModel
+ 
+ import store
++from backtest import run_ticker
+ from market import analyze_ticker, invalidate_cache, resolve_listed_ticker
+ 
+ ROOT = Path(__file__).resolve().parent
+@@ -97,6 +98,21 @@ def refresh():
+     return snapshot()
+ 
+ 
++@app.get("/api/backtest/{ticker}")
++def backtest_ticker(ticker: str, period: str = "5y", step: int = 3):
++    """Walk-forward test of the score on one ticker: forward returns, stop and
++    target hit rates by zone/setup. Slow (runs the analysis on every sampled
++    date), so use a coarse step for a first look."""
++    if period not in {"3y", "5y", "7y", "10y", "max"}:
++        raise HTTPException(400, "period must be one of 3y, 5y, 7y, 10y, max")
++    if not 1 <= step <= 20:
++        raise HTTPException(400, "step must be between 1 and 20")
++    try:
++        return run_ticker(ticker, period=period, step=step)
++    except ValueError as exc:
++        raise HTTPException(400, str(exc)) from exc
++
++
+ if __name__ == "__main__":
+     import uvicorn
+ 
+diff --git a/backtest.py b/backtest.py
+new file mode 100644
+index 0000000..80a72e7
+--- /dev/null
++++ b/backtest.py
+@@ -0,0 +1,241 @@
++#!/usr/bin/env python3
++"""Walk-forward validation of the buy-zone scores.
++
++For every sampled date the analysis is run on data up to that date ONLY (no
++lookahead), then the next bar's open is used as the entry and the outcome is
++measured forward: N-day returns, worst drawdown (MAE), whether the invalidation
++level or first target was hit first, and the result in R multiples.
++
++    python backtest.py RELIANCE TCS HDFCBANK --period 5y
++
++Caveats: a hand-picked watchlist has survivorship bias, costs/slippage are not
++modelled, and outcomes need a decent sample (n >= 30) before they mean much.
++"""
++
++from __future__ import annotations
++
++import argparse
++import math
++from typing import Any, Optional
++
++import numpy as np
++import pandas as pd
++
++from analysis import BUY_ZONES, analyze_frame, clean_ohlcv
++
++HORIZONS = (10, 20, 40)
++WARMUP = 260  # bars needed before the first evaluation (200-day average + slope)
++
++
++def _wilson(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
++    if n == 0:
++        return (float("nan"), float("nan"))
++    p = wins / n
++    d = 1 + z * z / n
++    c = p + z * z / (2 * n)
++    m = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
++    return ((c - m) / d, (c + m) / d)
++
++
++def _outcome(o, h, l, c, t: int, entry: float, inv: Optional[float], tgt: Optional[float], horizon: int):
++    """First-touch outcome over bars t+1..t+horizon. Stop wins a same-bar tie
++    (conservative); gaps through a level fill at the open, not the level."""
++    n = len(c)
++    end = min(t + horizon, n - 1)
++    if inv is None or entry <= inv:
++        return None, None
++    risk = entry - inv
++    for k in range(t + 1, end + 1):
++        if l[k] <= inv:
++            fill = min(o[k], inv)
++            return "stop", (fill - entry) / risk
++        if tgt is not None and h[k] >= tgt:
++            fill = max(o[k], tgt)
++            return "target", (fill - entry) / risk
++    if end - t < horizon:
++        return None, None  # not enough forward data to call it
++    return "timeout", (c[end] - entry) / risk
++
++
++def walk_forward(
++    ticker: str,
++    df: pd.DataFrame,
++    bench: Optional[pd.DataFrame] = None,
++    *,
++    warmup: int = WARMUP,
++    step: int = 3,
++    horizons: tuple[int, ...] = HORIZONS,
++    outcome_horizon: int = 40,
++) -> pd.DataFrame:
++    df = clean_ohlcv(df, ticker=ticker, drop_partial=False)
++    n = len(df)
++    if n < warmup + max(horizons) + 5:
++        raise ValueError(f"{ticker}: need at least {warmup + max(horizons) + 5} bars, have {n}")
++    o = df["Open"].to_numpy(float)
++    h = df["High"].to_numpy(float)
++    l = df["Low"].to_numpy(float)
++    c = df["Close"].to_numpy(float)
++
++    rows: list[dict[str, Any]] = []
++    for t in range(warmup, n - 1, step):
++        sl = df.iloc[: t + 1]
++        b = None
++        if bench is not None:
++            b = bench[bench.index <= sl.index[-1]]
++        try:
++            a = analyze_frame(
++                ticker, sl, bench=b, drop_partial=False, include_chart=False, now=sl.index[-1].date()
++            )
++        except Exception:
++            continue
++        entry = float(o[t + 1])
++        if not np.isfinite(entry) or entry <= 0:
++            continue
++        tg = a["targets"]
++        row: dict[str, Any] = {
++            "ticker": ticker,
++            "date": sl.index[-1],
++            "score": a["buy_score"],
++            "zone": a["zone"],
++            "setup": a["setup"],
++            "rr": a["risk_reward"],
++            "entry": entry,
++            "invalidation": a["invalidation"],
++            "target_1": tg["target_1"],
++            "in_band": bool(a["buy_from"] and a["buy_from"] <= entry <= (a["buy_to"] or 0) * 1.0),
++        }
++        for hz in horizons:
++            row[f"ret_{hz}"] = (c[t + hz] / entry - 1) * 100 if t + hz <= n - 1 else np.nan
++        end = min(t + 20, n - 1)
++        row["mae_20"] = (l[t + 1 : end + 1].min() / entry - 1) * 100 if end > t else np.nan
++        kind, r_mult = _outcome(o, h, l, c, t, entry, a["invalidation"], tg["target_1"], outcome_horizon)
++        row["outcome"] = kind
++        row["r"] = r_mult
++        rows.append(row)
++    return pd.DataFrame(rows)
++
++
++def dedupe_signals(sig: pd.DataFrame, cooldown_bars: int, step: int) -> pd.DataFrame:
++    """Keep one signal per ticker per cooldown window, so a single multi-week
++    dip is not counted as 10 independent wins."""
++    if sig.empty:
++        return sig
++    keep = []
++    for _, g in sig.sort_values("date").groupby("ticker"):
++        last_i = None
++        for i, (idx, _row) in enumerate(g.iterrows()):
++            if last_i is None or (i - last_i) * step >= cooldown_bars:
++                keep.append(idx)
++                last_i = i
++    return sig.loc[keep]
++
++
++def _summ(g: pd.DataFrame, base: dict[str, float]) -> dict[str, Any]:
++    n = len(g)
++    r20 = g["ret_20"].dropna()
++    wins = int((r20 > 0).sum())
++    lo, hi = _wilson(wins, len(r20))
++    out = {
++        "n": n,
++        "win_rate_20d": round(wins / len(r20) * 100, 1) if len(r20) else None,
++        "win_ci95": [round(lo * 100, 1), round(hi * 100, 1)] if len(r20) else None,
++        "mean_ret_10d": round(g["ret_10"].mean(), 2),
++        "mean_ret_20d": round(r20.mean(), 2) if len(r20) else None,
++        "median_ret_20d": round(r20.median(), 2) if len(r20) else None,
++        "mean_ret_40d": round(g["ret_40"].mean(), 2),
++        "edge_vs_all_20d": round(r20.mean() - base["mean_ret_20d"], 2) if len(r20) else None,
++        "avg_mae_20d": round(g["mae_20"].mean(), 2),
++        "low_sample": n < 30,
++    }
++    dec = g.dropna(subset=["outcome"])
++    if len(dec):
++        out["stop_rate"] = round((dec["outcome"] == "stop").mean() * 100, 1)
++        out["target_rate"] = round((dec["outcome"] == "target").mean() * 100, 1)
++        out["mean_R"] = round(dec["r"].mean(), 2)
++    return out
++
++
++def summarize(
++    results: pd.DataFrame, cooldown_bars: int = 10, step: int = 3
++) -> dict[str, Any]:
++    if results.empty:
++        return {"samples": 0}
++    base = {"mean_ret_20d": float(results["ret_20"].mean())}
++    summary: dict[str, Any] = {
++        "samples": int(len(results)),
++        "baseline_all_dates": _summ(results, base),
++        "by_zone": {},
++        "by_setup": {},
++        "by_score_bucket": {},
++    }
++    for zname, g in results.groupby("zone"):
++        summary["by_zone"][zname] = _summ(g, base)
++    for sname, g in results.groupby("setup"):
++        summary["by_setup"][sname] = _summ(g, base)
++    buckets = pd.cut(results["score"], [0, 40, 50, 62, 75, 101], right=False, labels=["<40", "40-50", "50-62", "62-75", "75+"])
++    for bname, g in results.groupby(buckets, observed=True):
++        summary["by_score_bucket"][str(bname)] = _summ(g, base)
++    sig = dedupe_signals(results[results["zone"].isin(BUY_ZONES)], cooldown_bars, step)
++    summary["buy_signals_deduped"] = _summ(sig, base) if len(sig) else {"n": 0}
++    rr_ok = sig[sig["rr"].fillna(0) >= 1.5]
++    summary["buy_signals_rr_ge_1_5"] = _summ(rr_ok, base) if len(rr_ok) else {"n": 0}
++    return summary
++
++
++def run_ticker(raw: str, period: str = "5y", step: int = 3) -> dict[str, Any]:
++    """Backtest one live ticker (needs network). Used by the API and CLI."""
++    from market import download_history, get_benchmark, resolve_listed_ticker  # lazy: avoids yfinance for unit tests
++
++    ticker = resolve_listed_ticker(raw)
++    df = download_history(ticker, period=period)
++    bench = get_benchmark(ticker, period=period)
++    res = walk_forward(ticker, df, bench=bench, step=step)
++    return {"ticker": ticker, "period": period, "summary": summarize(res, step=step)}
++
++
++def _print(summary: dict[str, Any]) -> None:
++    def table(title: str, d: dict[str, dict]):
++        if not d:
++            return
++        print(f"\n== {title}")
++        cols = ["n", "win_rate_20d", "mean_ret_20d", "edge_vs_all_20d", "avg_mae_20d", "stop_rate", "target_rate", "mean_R"]
++        print(f"{'':22}" + "".join(f"{c:>16}" for c in cols))
++        for k, v in d.items():
++            cells = "".join(f"{str(v.get(c, '-')):>16}" for c in cols)
++            flag = "  (low n)" if v.get("low_sample") else ""
++            print(f"{str(k):22}{cells}{flag}")
++
++    print(f"samples: {summary.get('samples')}")
++    table("baseline (every sampled date)", {"all": summary.get("baseline_all_dates", {})})
++    table("by zone", summary.get("by_zone", {}))
++    table("by setup", summary.get("by_setup", {}))
++    table("by score bucket", summary.get("by_score_bucket", {}))
++    table("buy signals (deduped)", {"buy": summary.get("buy_signals_deduped", {}), "buy & R:R>=1.5": summary.get("buy_signals_rr_ge_1_5", {})})
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description="Walk-forward test of the buy-zone score")
++    ap.add_argument("tickers", nargs="+")
++    ap.add_argument("--period", default="5y")
++    ap.add_argument("--step", type=int, default=3, help="evaluate every N bars")
++    args = ap.parse_args()
++
++    from market import download_history, get_benchmark, resolve_listed_ticker
++
++    frames = []
++    for raw in args.tickers:
++        try:
++            t = resolve_listed_ticker(raw)
++            df = download_history(t, period=args.period)
++            res = walk_forward(t, df, bench=get_benchmark(t, period=args.period), step=args.step)
++            frames.append(res)
++            print(f"{t}: {len(res)} samples")
++        except Exception as exc:
++            print(f"{raw}: skipped ({exc})")
++    if not frames:
++        raise SystemExit("nothing to summarise")
++    _print(summarize(pd.concat(frames, ignore_index=True), step=args.step))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/context.py b/context.py
+new file mode 100644
+index 0000000..1ee5f98
+--- /dev/null
++++ b/context.py
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python3
++"""Market context: exchange/region metadata, weekly trend, index regime, liquidity."""
++
++from __future__ import annotations
++
++from datetime import date, datetime, timedelta, timezone
++from typing import Any, Optional
++
++import numpy as np
++import pandas as pd
++
++try:
++    from zoneinfo import ZoneInfo
++except Exception:  # pragma: no cover
++    ZoneInfo = None  # type: ignore
++
++# region -> session timezone, minute the daily bar is final, benchmark index,
++# and traded-value thresholds (local currency/day) for the liquidity flag.
++# LSE quotes in pence, so no liquidity thresholds are applied outside IN/US.
++REGIONS: dict[str, dict[str, Any]] = {
++    "IN": dict(tz="Asia/Kolkata", close=(15, 35), bench="^NSEI", bench_name="Nifty", thin=5e7, illiquid=1e7, fixed=timedelta(hours=5, minutes=30)),
++    "US": dict(tz="America/New_York", close=(16, 5), bench="^GSPC", bench_name="S&P 500", thin=3e6, illiquid=5e5, fixed=timedelta(hours=-5)),
++    "GB": dict(tz="Europe/London", close=(16, 35), bench="^FTSE", bench_name="FTSE 100", thin=None, illiquid=None, fixed=timedelta(0)),
++    "JP": dict(tz="Asia/Tokyo", close=(15, 35), bench="^N225", bench_name="Nikkei 225", thin=None, illiquid=None, fixed=timedelta(hours=9)),
++    "HK": dict(tz="Asia/Hong_Kong", close=(16, 15), bench="^HSI", bench_name="Hang Seng", thin=None, illiquid=None, fixed=timedelta(hours=8)),
++    "CA": dict(tz="America/Toronto", close=(16, 5), bench="^GSPTSE", bench_name="S&P/TSX", thin=None, illiquid=None, fixed=timedelta(hours=-5)),
++    "AU": dict(tz="Australia/Sydney", close=(16, 15), bench="^AXJO", bench_name="ASX 200", thin=None, illiquid=None, fixed=timedelta(hours=10)),
++    "DE": dict(tz="Europe/Berlin", close=(17, 35), bench="^GDAXI", bench_name="DAX", thin=None, illiquid=None, fixed=timedelta(hours=1)),
++    "FR": dict(tz="Europe/Paris", close=(17, 35), bench="^FCHI", bench_name="CAC 40", thin=None, illiquid=None, fixed=timedelta(hours=1)),
++    "SG": dict(tz="Asia/Singapore", close=(17, 5), bench="^STI", bench_name="STI", thin=None, illiquid=None, fixed=timedelta(hours=8)),
++}
++_SUFFIX = {
++    ".NS": "IN", ".BO": "IN", ".L": "GB", ".T": "JP", ".HK": "HK",
++    ".TO": "CA", ".V": "CA", ".AX": "AU", ".DE": "DE", ".PA": "FR", ".SI": "SG",
++}
++_INDEX = {
++    "^NSEI": "IN", "^NSEBANK": "IN", "^BSESN": "IN", "^CNXIT": "IN",
++    "^GSPC": "US", "^IXIC": "US", "^DJI": "US", "^RUT": "US",
++    "^FTSE": "GB", "^N225": "JP", "^HSI": "HK", "^GSPTSE": "CA",
++    "^AXJO": "AU", "^GDAXI": "DE", "^FCHI": "FR", "^STI": "SG",
++}
++
++
++def region_of(ticker: str) -> str:
++    t = (ticker or "").upper()
++    if t.startswith("^"):
++        return _INDEX.get(t, "US")
++    if "." in t:
++        return _SUFFIX.get(t[t.rfind(".") :], "US")  # BRK.B etc. fall through to US
++    return "US"
++
++
++def benchmark_for(ticker: str) -> str:
++    return REGIONS[region_of(ticker)]["bench"]
++
++
++def benchmark_name(ticker: str) -> str:
++    return REGIONS[region_of(ticker)]["bench_name"]
++
++
++def _tz(region: str):
++    info = REGIONS[region]
++    if ZoneInfo is not None:
++        try:
++            return ZoneInfo(info["tz"])
++        except Exception:
++            pass
++    return timezone(info["fixed"])  # no tzdata (e.g. Windows): fixed offset
++
++
++def market_now(region: str) -> datetime:
++    return datetime.now(_tz(region))
++
++
++def market_today(region: str) -> date:
++    return market_now(region).date()
++
++
++def session_is_open_for_bar(last_ts: pd.Timestamp, region: str, now: Optional[datetime] = None) -> bool:
++    """True if `last_ts` is today's bar in the exchange's own timezone and the
++    session has not finished, i.e. the bar is still forming."""
++    tz = _tz(region)
++    now = now.astimezone(tz) if now is not None else market_now(region)
++    ts = pd.Timestamp(last_ts)
++    if ts.tzinfo is not None:
++        ts = ts.tz_convert(tz)
++    if ts.date() != now.date():
++        return False
++    h, m = REGIONS[region]["close"]
++    return (now.hour, now.minute) < (h, m)
++
++
++# --------------------------------------------------------------------------
++# Weekly confluence
++# --------------------------------------------------------------------------
++def _wilder(series: pd.Series, period: int) -> pd.Series:
++    return series.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
++
++
++def weekly_context(df: pd.DataFrame) -> dict[str, Any]:
++    """Higher-timeframe trend. A daily pullback inside a rising weekly trend is
++    a very different trade from a daily bounce inside a falling one."""
++    out: dict[str, Any] = {"trend": "unknown", "rsi": None, "above_30w": None, "sma30_slope": None}
++    try:
++        wc = df["Close"].resample("W-FRI").last().dropna()
++    except Exception:
++        return out
++    if len(wc) < 34:
++        return out
++    sma10 = wc.rolling(10).mean()
++    sma30 = wc.rolling(30).mean()
++    delta = wc.diff()
++    ag = _wilder(delta.clip(lower=0), 14)
++    al = _wilder((-delta).clip(lower=0), 14)
++    with np.errstate(divide="ignore", invalid="ignore"):
++        rsi = 100 - 100 / (1 + ag / al)
++    c, s30, s10 = float(wc.iloc[-1]), float(sma30.iloc[-1]), float(sma10.iloc[-1])
++    slope = float((sma30.iloc[-1] / sma30.iloc[-5] - 1) * 100) if sma30.iloc[-5] else 0.0
++    if c > s30 and slope > 0:
++        trend = "up"
++    elif c < s30 and slope < 0:
++        trend = "down"
++    else:
++        trend = "mixed"
++    r = rsi.iloc[-1]
++    out.update(
++        trend=trend,
++        rsi=round(float(r), 1) if np.isfinite(r) else None,
++        above_30w=bool(c > s30),
++        sma30_slope=round(slope, 2),
++        sma10_above_30=bool(s10 > s30),
++    )
++    return out
++
++
++# --------------------------------------------------------------------------
++# Index regime
++# --------------------------------------------------------------------------
++def market_regime(bench: Optional[pd.DataFrame], symbol: str = "") -> dict[str, Any]:
++    out: dict[str, Any] = {"state": "unknown", "symbol": symbol, "drawdown_pct": None}
++    if bench is None or len(bench) < 60:
++        return out
++    c = bench["Close"].astype(float)
++    last = float(c.iloc[-1])
++    sma50 = float(c.rolling(50).mean().iloc[-1])
++    sma200 = c.rolling(200).mean().iloc[-1]
++    above50 = last > sma50
++    above200 = bool(last > sma200) if np.isfinite(sma200) else above50
++    peak = float(c.rolling(252, min_periods=60).max().iloc[-1])
++    dd = (last / peak - 1) * 100 if peak else 0.0
++    if above200 and above50:
++        state = "bull"
++    elif (not above200 and not above50) or dd <= -15:
++        state = "bear"
++    else:
++        state = "neutral"
++    out.update(state=state, above_200=above200, above_50=bool(above50), drawdown_pct=round(dd, 1))
++    return out
++
++
++# --------------------------------------------------------------------------
++# Liquidity
++# --------------------------------------------------------------------------
++def liquidity_info(df: pd.DataFrame, region: str) -> dict[str, Any]:
++    tv = (df["Close"] * df["Volume"]).tail(20)
++    adv = float(tv.median()) if len(tv) else 0.0
++    zero_range_days = int((df["High"] == df["Low"]).tail(10).sum())
++    cfg = REGIONS[region]
++    state = "ok"
++    if cfg["thin"] is not None:
++        if adv < cfg["illiquid"]:
++            state = "illiquid"
++        elif adv < cfg["thin"]:
++            state = "thin"
++    if zero_range_days >= 3:
++        state = "circuit_or_illiquid"
++    return {"state": state, "adv_value": round(adv, 0), "zero_range_days": zero_range_days}
+diff --git a/market.py b/market.py
+index 3296e97..efff78d 100644
+--- a/market.py
++++ b/market.py
+@@ -10,21 +10,23 @@ from typing import Any, Optional
+ import pandas as pd
+ import yfinance as yf
+ 
+-_YF_LOCK = threading.Lock()
+-
+ from analysis import (
+-    BENCHMARK,
+     analyze_frame,
+     clean_ohlcv,
+     empty_error,
+     nse_candidate,
+     resolve_ticker,
+ )
++from context import benchmark_for
++
++_YF_LOCK = threading.Lock()
+ 
+ CACHE_TTL = 15 * 60
+-_price_cache: dict[str, tuple[float, pd.DataFrame]] = {}
++FAIL_TTL = 60  # an empty/failed download is retried after a minute, not 15
++MIN_BARS_LISTED = 80
++
++_price_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
+ _info_cache: dict[str, tuple[float, dict]] = {}
+-_bench_cache: tuple[float, Optional[pd.DataFrame]] | None = None
+ 
+ 
+ def _fresh(entry, ttl=CACHE_TTL):
+@@ -36,19 +38,28 @@ def _fresh(entry, ttl=CACHE_TTL):
+     return payload
+ 
+ 
++def _stamp(ok: bool, ttl: int = CACHE_TTL) -> float:
++    """Timestamp that makes an entry expire after FAIL_TTL when it is a failure."""
++    return time.time() if ok else time.time() - (ttl - FAIL_TTL)
++
++
+ def download_history(ticker: str, period: str = "2y") -> pd.DataFrame:
+-    cached = _fresh(_price_cache.get(ticker))
++    key = (ticker, period)
++    cached = _fresh(_price_cache.get(key))
+     if cached is not None:
+         return cached.copy()
+     with _YF_LOCK:
+-        cached = _fresh(_price_cache.get(ticker))
++        cached = _fresh(_price_cache.get(key))
+         if cached is not None:
+             return cached.copy()
+-        df = yf.download(
+-            ticker, period=period, progress=False, auto_adjust=True, threads=False
+-        )
+-        df = clean_ohlcv(df)
+-        _price_cache[ticker] = (time.time(), df)
++        try:
++            raw = yf.download(
++                ticker, period=period, progress=False, auto_adjust=True, threads=False
++            )
++            df = clean_ohlcv(raw, ticker=ticker)
++        except Exception:
++            df = pd.DataFrame()
++        _price_cache[key] = (_stamp(len(df) > 0), df)
+         return df.copy()
+ 
+ 
+@@ -71,18 +82,16 @@ def fetch_info(ticker: str) -> tuple[dict, Any]:
+             calendar = t.calendar
+         except Exception:
+             calendar = None
+-        _info_cache[ticker] = (time.time(), {"info": info, "calendar": calendar})
++        ok = bool(info)
++        _info_cache[ticker] = (_stamp(ok, 6 * 3600), {"info": info, "calendar": calendar})
+         return info, calendar
+ 
+ 
+-def get_benchmark() -> Optional[pd.DataFrame]:
+-    global _bench_cache
+-    cached = _fresh(_bench_cache) if _bench_cache else None
+-    if cached is not None:
+-        return cached
+-    df = download_history(BENCHMARK, period="2y")
+-    _bench_cache = (time.time(), df)
+-    return df
++def get_benchmark(ticker: str, period: str = "2y") -> Optional[pd.DataFrame]:
++    """Index matched to the ticker's exchange (Nifty for .NS/.BO, S&P 500 for
++    US listings, ...). Relative strength vs the wrong index is meaningless."""
++    df = download_history(benchmark_for(ticker), period=period)
++    return df if len(df) else None
+ 
+ 
+ def resolve_listed_ticker(raw: str) -> str:
+@@ -90,16 +99,14 @@ def resolve_listed_ticker(raw: str) -> str:
+     # Bare symbols in this project are usually NSE. Try .NS first, then the
+     # raw Yahoo symbol (US / other listings). Explicit suffixes win as-is.
+     candidates = [ticker] if "." in ticker else [nse_candidate(ticker), ticker]
+-    seen = []
++    seen: list[str] = []
+     for cand in candidates:
+         if cand in seen:
+             continue
+         seen.append(cand)
+         df = download_history(cand)
+-        if len(df) >= 80:
++        if len(df) >= MIN_BARS_LISTED:
+             return cand
+-    if seen:
+-        raise ValueError(f"No price history for {raw}")
+     raise ValueError(f"No price history for {raw}")
+ 
+ 
+@@ -113,18 +120,17 @@ def analyze_ticker(raw: str) -> dict[str, Any]:
+         if df.empty:
+             return empty_error(ticker, "No price data")
+         info, calendar = fetch_info(ticker)
+-        bench = get_benchmark()
++        bench = get_benchmark(ticker)
+         return analyze_frame(ticker, df, bench=bench, info=info, calendar=calendar)
+     except Exception as exc:
+         return empty_error(ticker, f"{type(exc).__name__}: {exc}")
+ 
+ 
+ def invalidate_cache(ticker: Optional[str] = None) -> None:
+-    global _bench_cache
+     if ticker:
+-        _price_cache.pop(ticker, None)
++        for key in [k for k in _price_cache if k[0] == ticker]:
++            _price_cache.pop(key, None)
+         _info_cache.pop(ticker, None)
+     else:
+         _price_cache.clear()
+         _info_cache.clear()
+-        _bench_cache = None
+diff --git a/pytest.ini b/pytest.ini
+new file mode 100644
+index 0000000..eeb9d41
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,3 @@
++[pytest]
++testpaths = tests
++addopts = -q
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+index 0000000..e3fcd49
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1,3 @@
++-r requirements.txt
++pytest>=8
++httpx>=0.27
+diff --git a/static/app.js b/static/app.js
+index 790168a..3ee8cc0 100644
+--- a/static/app.js
++++ b/static/app.js
+@@ -104,12 +104,22 @@ function renderDetail(s) {
+   $("d-zone").textContent = ZONE_LABEL[s.zone] || s.zone;
+   const inv = s.invalidation ? `Invalidate below <strong>${fmt(s.invalidation)}</strong>` : "";
+   const inBand = s.in_buy_band ? "Price is inside the band." : "Price is outside the band.";
++  const tg = s.targets || {};
++  const tgt = tg.target_1
++    ? `Target <strong>${fmt(tg.target_1)}</strong>${tg.target_2 ? ` → ${fmt(tg.target_2)}` : ""}${tg.source === "projected" ? " (projected, no overhead zone)" : ""}`
++    : "";
++  const rr = s.risk_reward != null ? `Reward:risk <strong>${fmt(s.risk_reward, 1)}</strong>` : "";
++  const sizing = s.size_pct_for_1pct_risk
++    ? `Stop is ${fmt(s.risk_pct, 1)}% away: ~${fmt(s.size_pct_for_1pct_risk, 0)}% of capital risks 1%`
++    : "";
+   $("d-band").innerHTML = s.buy_from
+-    ? `Buy band <strong>${fmt(s.buy_from)} – ${fmt(s.buy_to)}</strong><br>${inBand}<br>${inv}`
+-    : "No reliable support band yet.";
++    ? [`Buy band <strong>${fmt(s.buy_from)} – ${fmt(s.buy_to)}</strong>`, inBand, inv, tgt, rr, sizing]
++        .filter(Boolean)
++        .join("<br>")
++    : "No reliable demand zone to define an entry yet.";
+   $("d-signals").innerHTML = (s.signals || []).map((x) => `<li>${x}</li>`).join("");
+   const scores = s.scores || {};
+-  $("d-bars").innerHTML = ["location", "momentum", "trend", "volume"]
++  $("d-bars").innerHTML = ["location", "momentum", "trend", "volume", "risk"]
+     .map(
+       (k) => `<div>
+         <div class="bar-lbl"><span>${k}</span><span>${scores[k] ?? "—"}</span></div>
+@@ -119,13 +129,18 @@ function renderDetail(s) {
+     .join("");
+   const t = s.technicals || {};
+   const f = s.fundamentals || {};
++  const bn = (s.benchmark && s.benchmark.name) || "index";
+   const rows = [
+     ["RSI (14)", fmt(t.rsi, 1)],
+     ["ADX", fmt(t.adx, 1)],
+     ["+DI / −DI", `${fmt(t.plus_di, 1)} / ${fmt(t.minus_di, 1)}`],
+     ["Rel volume", fmt(t.rel_vol, 2) + "x"],
+     ["CMF", fmt(t.cmf, 3)],
+-    ["20d vs Nifty", (t.rs_20 > 0 ? "+" : "") + fmt(t.rs_20, 2)],
++    [`20d vs ${bn}`, t.rs_20 == null ? "—" : (t.rs_20 > 0 ? "+" : "") + fmt(t.rs_20, 2)],
++    [`60d vs ${bn}`, t.rs_60 == null ? "—" : (t.rs_60 > 0 ? "+" : "") + fmt(t.rs_60, 2)],
++    ["Weekly trend", (s.weekly && s.weekly.trend) || "—"],
++    [`${bn} regime`, (s.regime && s.regime.state) || "—"],
++    ["Liquidity", (s.liquidity && s.liquidity.state) || "—"],
+     ["60d drawdown", fmt(t.dd_60, 1) + "%"],
+     ["52w position", t.pos_52w != null ? fmt(t.pos_52w, 1) + "%" : "—"],
+     ["SMA 20 / dist", `${fmt(t.sma20)}  (${fmt(t.dist_sma20)}%)`],
+@@ -140,7 +155,7 @@ function renderDetail(s) {
+   $("d-tech").innerHTML = rows
+     .map(([a, b]) => `<div><span>${a}</span><b>${b}</b></div>`)
+     .join("");
+-  drawChart(s.chart || {});
++  drawChart(s.chart || {}, s);
+ }
+ 
+ function linePath(values, w, h, padT, padB, scaleMin, scaleMax) {
+@@ -162,7 +177,35 @@ function linePath(values, w, h, padT, padB, scaleMin, scaleMax) {
+   return { d, min, max };
+ }
+ 
+-function drawChart(chart) {
++function zoneRects(chart, s, w, h, pMin, pMax) {
++  const span = pMax - pMin || 1;
++  const y = (v) => 12 + (1 - (Math.min(Math.max(v, pMin), pMax) - pMin) / span) * (h - 12 - 36);
++  const rect = (lo, hi, fill, stroke) => {
++    if (hi < pMin || lo > pMax) return "";
++    const y1 = y(hi);
++    const y2 = y(lo);
++    return `<rect x="0" y="${y1.toFixed(1)}" width="${w}" height="${Math.max(y2 - y1, 1.5).toFixed(1)}" fill="${fill}" stroke="${stroke}" stroke-width="0.6"/>`;
++  };
++  let out = "";
++  (chart.zones || []).forEach((z) => {
++    out += z.role === "support"
++      ? rect(z.low, z.high, "rgba(111,191,115,0.10)", "rgba(111,191,115,0.35)")
++      : rect(z.low, z.high, "rgba(205,102,95,0.10)", "rgba(205,102,95,0.35)");
++  });
++  if (s && s.buy_from && s.buy_to) out += rect(s.buy_from, s.buy_to, "rgba(196,163,90,0.18)", "rgba(196,163,90,0.7)");
++  if (s && s.invalidation && s.invalidation >= pMin) {
++    const yy = y(s.invalidation).toFixed(1);
++    out += `<line x1="0" y1="${yy}" x2="${w}" y2="${yy}" stroke="#cd665f" stroke-dasharray="4 3" stroke-width="0.8"/>`;
++  }
++  const t1 = s && s.targets && s.targets.target_1;
++  if (t1 && t1 <= pMax) {
++    const yy = y(t1).toFixed(1);
++    out += `<line x1="0" y1="${yy}" x2="${w}" y2="${yy}" stroke="#6fbf73" stroke-dasharray="4 3" stroke-width="0.8"/>`;
++  }
++  return out;
++}
++
++function drawChart(chart, s) {
+   const svg = $("chart");
+   const rsiSvg = $("rsi-chart");
+   const close = chart.close || [];
+@@ -176,13 +219,14 @@ function drawChart(chart) {
+   const all = close.concat(chart.sma20 || [], chart.sma50 || [], chart.sma200 || []).filter((v) => v != null);
+   const pMin = Math.min(...all);
+   const pMax = Math.max(...all);
++  const zonesSvg = zoneRects(chart, s, w, h, pMin, pMax);
+   const price = linePath(close, w, h, 12, 36, pMin, pMax);
+   const s20 = linePath(chart.sma20 || [], w, h, 12, 36, pMin, pMax);
+   const s50 = linePath(chart.sma50 || [], w, h, 12, 36, pMin, pMax);
+   const s200 = linePath(chart.sma200 || [], w, h, 12, 36, pMin, pMax);
+   const last = close.filter((v) => v != null).pop();
+   svg.innerHTML = `
+-    <polyline fill="none" stroke="#8b9088" stroke-width="1.2" points="" />
++    ${zonesSvg}
+     <path d="${price.d}" fill="none" stroke="#e8e6df" stroke-width="1.6"/>
+     <path d="${s20.d}" fill="none" stroke="#c4a35a" stroke-width="1"/>
+     <path d="${s50.d}" fill="none" stroke="#6f9fbf" stroke-width="1"/>
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..e7ff2a3
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,7 @@
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++for p in (str(ROOT), str(ROOT / "tests")):
++    if p not in sys.path:
++        sys.path.insert(0, p)
+diff --git a/tests/synth.py b/tests/synth.py
+new file mode 100644
+index 0000000..02172bc
+--- /dev/null
++++ b/tests/synth.py
+@@ -0,0 +1,82 @@
++"""Deterministic synthetic OHLCV generators for tests (no network needed)."""
++import numpy as np
++import pandas as pd
++
++
++def make_ohlcv(closes, seed=0, vol_base=1_000_000, start="2023-01-02", wick=0.006, vol_fn=None):
++    closes = np.asarray(closes, dtype=float)
++    n = len(closes)
++    rng = np.random.default_rng(seed)
++    idx = pd.bdate_range(start=start, periods=n)
++    opens = np.empty(n)
++    opens[0] = closes[0]
++    opens[1:] = closes[:-1] * (1 + rng.normal(0, 0.002, n - 1))
++    hi = np.maximum(opens, closes) * (1 + np.abs(rng.normal(0, wick, n)))
++    lo = np.minimum(opens, closes) * (1 - np.abs(rng.normal(0, wick, n)))
++    vol = vol_base * (1 + rng.normal(0, 0.15, n)).clip(0.4, None)
++    if vol_fn is not None:
++        vol = vol * vol_fn(np.arange(n))
++    return pd.DataFrame({"Open": opens, "High": hi, "Low": lo, "Close": closes, "Volume": vol.astype(float)}, index=idx)
++
++
++def trend_with_pullback(n_up=330, pull=14, drift=0.0012, vol=0.011, seed=1, start_price=100.0):
++    """Steady uptrend, then a pullback of `pull` bars (~8%), ending near a prior swing zone."""
++    rng = np.random.default_rng(seed)
++    r = rng.normal(drift, vol, n_up)
++    r2 = rng.normal(-0.006, 0.008, pull)
++    px = start_price * np.exp(np.cumsum(np.concatenate([r, r2])))
++    return px
++
++
++def downtrend(n=330, drift=-0.0020, vol=0.012, seed=2, start_price=200.0):
++    rng = np.random.default_rng(seed)
++    return start_price * np.exp(np.cumsum(rng.normal(drift, vol, n)))
++
++
++def parabolic(n=330, seed=3):
++    rng = np.random.default_rng(seed)
++    base = 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.008, n - 40)))
++    spike = base[-1] * np.exp(np.cumsum(rng.normal(0.012, 0.008, 40)))
++    return np.concatenate([base, spike])
++
++
++def range_with_levels(n=400, seed=4, lo=90.0, hi=110.0):
++    """Oscillates between planted support (lo) and resistance (hi)."""
++    rng = np.random.default_rng(seed)
++    t = np.arange(n)
++    mid, amp = (lo + hi) / 2, (hi - lo) / 2
++    return mid + amp * np.sin(2 * np.pi * t / 50) * 0.92 + rng.normal(0, 0.4, n)
++
++
++def piecewise(waypoints, noise=0.004, seed=0):
++    """Linear path through (bar, price) waypoints with small multiplicative noise."""
++    bars = np.arange(waypoints[-1][0] + 1)
++    xs, ys = zip(*waypoints)
++    path = np.interp(bars, xs, ys)
++    rng = np.random.default_rng(seed)
++    return path * (1 + rng.normal(0, noise, len(bars)))
++
++
++# Staircase uptrend with swing lows planted at ~112, ~130, ~148 and highs at ~120/140/160/185.
++UPTREND_WAYPOINTS = [
++    (0, 100), (60, 120), (80, 112), (130, 140), (150, 130), (200, 160),
++    (225, 148), (270, 185),
++]
++
++
++def uptrend_pullback_to_zone(end_price=150.0, seed=0, noise=0.004):
++    """Uptrend, a sharp 15% drop, then a choppy base that finally dips into the ~148 swing-low zone."""
++    tail = [(300, 158), (310, 164), (322, 153), (329, 158), (336, end_price)]
++    return piecewise(UPTREND_WAYPOINTS + tail, noise=noise, seed=seed)
++
++
++# A 160 high tested twice (bars 200 and 218), broken out ~bar 235, then price pulls back
++# to retest it from above after peaking at 185.
++RETEST_WAYPOINTS = [
++    (0, 100), (60, 120), (80, 112), (130, 140), (150, 130), (200, 160),
++    (210, 153), (218, 160), (225, 148), (270, 185), (298, 163), (304, 166),
++]
++
++
++def uptrend_retest(seed=0, noise=0.004):
++    return piecewise(RETEST_WAYPOINTS, noise=noise, seed=seed)
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..2658c55
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,152 @@
++import json
++from datetime import datetime, timedelta
++
++import numpy as np
++import pandas as pd
++import pytest
++
++import synth
++from analysis import BUY_ZONES, analyze_frame, clean_ohlcv, swing_points
++from context import benchmark_for, region_of, session_is_open_for_bar
++
++LEGACY_KEYS = {
++    "ticker", "symbol", "name", "sector", "price", "change_1d", "change_20d", "buy_score", "zone",
++    "setup", "signals", "buy_from", "buy_to", "invalidation", "support", "resistance", "risk_reward",
++    "in_buy_band", "limited_history", "scores", "technicals", "fundamentals", "fib", "as_of", "chart",
++}
++
++
++def run(px, ticker="TEST.NS", bench=None, seed=0, **kw):
++    df = synth.make_ohlcv(px, seed=seed, **kw)
++    if bench is None:
++        bench = synth.make_ohlcv(synth.piecewise([(0, 100), (len(px) - 1, 150)], noise=0.004, seed=5), seed=5)
++    return analyze_frame(ticker, df, bench=bench, drop_partial=False, now=df.index[-1].date())
++
++
++def test_legacy_output_contract_preserved():
++    a = run(synth.uptrend_retest(seed=1), seed=1)
++    assert LEGACY_KEYS <= set(a)
++    assert {"location", "momentum", "trend", "volume"} <= set(a["scores"])
++    json.dumps(a, allow_nan=False)  # FastAPI-safe: no numpy scalars, no NaN
++
++
++@pytest.mark.parametrize("seed", [0, 1, 2])
++def test_healthy_pullback_into_retested_zone_is_a_buy_zone(seed):
++    a = run(synth.uptrend_retest(seed=seed), seed=seed)
++    assert a["zone"] in BUY_ZONES
++    assert a["setup"] in ("Quality pullback", "Breakout retest")
++    assert a["invalidation"] < a["buy_from"] < a["buy_to"]
++    assert a["targets"]["target_1"] > a["targets"]["entry_ref"] > a["invalidation"]
++    assert a["risk_reward"] > 0 and a["size_pct_for_1pct_risk"] > 0
++    assert a["weekly"]["trend"] == "up"
++
++
++def test_straight_line_crash_is_avoid_not_buy():
++    a = run(synth.uptrend_pullback_to_zone(end_price=140.0), seed=1)
++    assert a["zone"] == "avoid"
++    assert a["buy_from"] is None and a["invalidation"] is None and a["risk_reward"] is None
++
++
++def test_parabolic_spike_is_extended():
++    a = run(synth.parabolic(), seed=3)
++    assert a["zone"] == "extended"
++
++
++def test_stale_data_gives_no_signal():
++    px = synth.uptrend_retest(seed=1)
++    df = synth.make_ohlcv(px, seed=1)
++    a = analyze_frame("TEST.NS", df, drop_partial=False, now=df.index[-1].date() + timedelta(days=30))
++    assert a["zone"] == "neutral" and a["stale_days"] == 30
++    assert any("stale" in s.lower() for s in a["signals"])
++
++
++def test_buy_zone_always_has_defined_entry_stop_and_acceptable_rr():
++    rng = np.random.default_rng(7)
++    seen_buy = 0
++    for k in range(60):
++        n = int(rng.integers(120, 480))
++        px = 100 * np.exp(np.cumsum(rng.normal(rng.normal(0, 0.002), rng.uniform(0.004, 0.04), n)))
++        a = run(px, seed=k)
++        json.dumps(a, allow_nan=False)
++        if a["zone"] in BUY_ZONES:
++            seen_buy += 1
++            assert a["buy_from"] is not None and a["invalidation"] < a["buy_from"] < a["buy_to"]
++            assert a["risk_reward"] is None or a["risk_reward"] >= 1.0
++            if a["zone"] == "strong_buy_zone":
++                assert a["risk_reward"] is not None and a["risk_reward"] >= 1.5
++    assert seen_buy >= 1  # the fuzz set actually exercised the buy path
++
++
++def test_bands_and_stops_scale_with_volatility():
++    px = synth.uptrend_retest(seed=1)
++    calm = run(px, seed=1, wick=0.004)
++    wild = run(px, seed=1, wick=0.014)
++    assert wild["technicals"]["atr"] > calm["technicals"]["atr"] * 1.5
++    if calm["invalidation"] and wild["invalidation"]:
++        d = lambda a: a["buy_from"] - a["invalidation"]
++        assert d(wild) > d(calm)
++
++
++def test_bearish_index_regime_lowers_score():
++    px = synth.uptrend_retest(seed=1)
++    bull = run(px, seed=1)
++    bear_bench = synth.make_ohlcv(synth.piecewise([(0, 150), (len(px) - 1, 90)], noise=0.004, seed=6), seed=6)
++    bear = run(px, seed=1, bench=bear_bench)
++    assert bull["regime"]["state"] == "bull" and bear["regime"]["state"] == "bear"
++    assert bear["buy_score"] < bull["buy_score"]
++
++
++def test_thin_liquidity_is_flagged_and_penalised():
++    px = synth.uptrend_retest(seed=1)
++    liquid = run(px, seed=1, vol_base=1_000_000)
++    thin = run(px, seed=1, vol_base=100_000)  # ~Rs 1.6 Cr/day
++    assert liquid["liquidity"]["state"] == "ok" and thin["liquidity"]["state"] == "thin"
++    assert thin["buy_score"] <= liquid["buy_score"]
++
++
++def test_us_ticker_is_scored_against_sp500_not_nifty():
++    a = run(synth.uptrend_retest(seed=1), ticker="AAPL", seed=1)
++    assert a["benchmark"]["symbol"] == "^GSPC" and a["benchmark"]["name"] == "S&P 500"
++    assert not any("Nifty" in s for s in a["signals"])
++
++
++def test_benchmark_and_region_mapping():
++    assert benchmark_for("RELIANCE.NS") == "^NSEI"
++    assert benchmark_for("TCS.BO") == "^NSEI"
++    assert benchmark_for("AAPL") == "^GSPC"
++    assert benchmark_for("BRK.B") == "^GSPC"  # class-share dot is not an exchange suffix
++    assert benchmark_for("VOD.L") == "^FTSE"
++    assert region_of("^NSEI") == "IN" and region_of("^GSPC") == "US"
++
++
++def test_partial_bar_rule_is_exchange_aware():
++    ist = datetime.fromisoformat("2026-11-16T10:00:00+05:30")  # NSE open, US still closed (prev. session)
++    today = pd.Timestamp("2026-11-16")
++    assert session_is_open_for_bar(today, "IN", now=ist)  # NSE bar for today still forming
++    assert not session_is_open_for_bar(today, "IN", now=datetime.fromisoformat("2026-11-16T16:00:00+05:30"))
++    # 21:00 IST is 10:30 ET: a bar dated today on a US ticker is still forming (old IST-only rule missed this).
++    assert session_is_open_for_bar(today, "US", now=datetime.fromisoformat("2026-11-16T21:00:00+05:30"))
++    # a bar from a previous date is never partial
++    assert not session_is_open_for_bar(pd.Timestamp("2026-11-13"), "IN", now=ist)
++
++
++def test_clean_ohlcv_repairs_bad_prints_and_dedupes():
++    df = synth.make_ohlcv(np.linspace(100, 120, 100))
++    df.iloc[10, df.columns.get_loc("High")] = df.iloc[10]["Low"] - 5  # high below low
++    df.iloc[20, df.columns.get_loc("Open")] = np.nan
++    df = pd.concat([df, df.iloc[[-1]]])  # duplicated last bar
++    out = clean_ohlcv(df, ticker="X.NS", drop_partial=False)
++    assert len(out) == 100
++    assert (out["High"] >= out[["Open", "Close", "Low"]].max(axis=1)).all()
++    assert (out["Low"] <= out[["Open", "Close", "High"]].min(axis=1)).all()
++    assert out["Open"].notna().all()
++
++
++def test_too_little_history_raises():
++    with pytest.raises(ValueError):
++        run(np.linspace(100, 110, 50))
++
++
++def test_swing_points_backcompat():
++    s = pd.Series(np.sin(np.linspace(0, 12, 120)))
++    assert len(swing_points(s)) >= 4
+diff --git a/tests/test_backtest.py b/tests/test_backtest.py
+new file mode 100644
+index 0000000..6c55c04
+--- /dev/null
++++ b/tests/test_backtest.py
+@@ -0,0 +1,90 @@
++import numpy as np
++import pandas as pd
++
++import synth
++from backtest import _outcome, dedupe_signals, summarize, walk_forward
++
++
++def arrs(rows):
++    o, h, l, c = (np.array(x, float) for x in zip(*rows))
++    return o, h, l, c
++
++
++def test_outcome_stop_target_gap_and_tie():
++    # bars: signal bar t=0, then next bars (o, h, l, c)
++    bars = [(100, 100, 100, 100), (100, 103, 99, 102), (102, 111, 101, 110)]
++    o, h, l, c = arrs(bars)
++    assert _outcome(o, h, l, c, 0, 100, 95, 110, 2)[0] == "target"
++    # stop first
++    bars = [(100, 100, 100, 100), (100, 101, 94, 96), (96, 120, 95, 118)]
++    o, h, l, c = arrs(bars)
++    kind, r = _outcome(o, h, l, c, 0, 100, 95, 110, 2)
++    assert kind == "stop" and round(r, 2) == -1.0
++    # same bar touches both: conservative = stop
++    bars = [(100, 100, 100, 100), (100, 112, 94, 100), (100, 100, 100, 100)]
++    o, h, l, c = arrs(bars)
++    assert _outcome(o, h, l, c, 0, 100, 95, 110, 2)[0] == "stop"
++    # gap down through the stop fills at the open (worse than -1R)
++    bars = [(100, 100, 100, 100), (90, 91, 88, 89), (89, 90, 88, 89)]
++    o, h, l, c = arrs(bars)
++    kind, r = _outcome(o, h, l, c, 0, 100, 95, 110, 2)
++    assert kind == "stop" and r < -1.5
++    # timeout and insufficient data
++    bars = [(100, 100, 100, 100), (100, 102, 99, 101), (101, 103, 100, 102)]
++    o, h, l, c = arrs(bars)
++    assert _outcome(o, h, l, c, 0, 100, 95, 110, 2)[0] == "timeout"
++    assert _outcome(o, h, l, c, 0, 100, 95, 110, 5)[0] is None
++    # no stop defined / entry already below stop -> no outcome
++    assert _outcome(o, h, l, c, 0, 100, None, 110, 2) == (None, None)
++    assert _outcome(o, h, l, c, 0, 94, 95, 110, 2) == (None, None)
++
++
++def _series(n=700, seed=11):
++    rng = np.random.default_rng(seed)
++    return synth.make_ohlcv(100 * np.exp(np.cumsum(rng.normal(0.0005, 0.013, n))), seed=seed)
++
++
++def test_walk_forward_shape_and_columns():
++    df = _series()
++    res = walk_forward("T.NS", df, step=20)
++    assert len(res) >= 15
++    assert {"date", "score", "zone", "setup", "entry", "ret_10", "ret_20", "ret_40", "mae_20", "outcome", "r"} <= set(res.columns)
++    assert (res["mae_20"] <= 0).mean() > 0.9  # worst excursion from the entry is a drawdown
++    # entries are the NEXT bar's open, never the signal bar's close
++    row = res.iloc[3]
++    pos = df.index.get_loc(row["date"])
++    assert row["entry"] == df["Open"].iloc[pos + 1]
++
++
++def test_walk_forward_has_no_lookahead():
++    """Scrambling every bar after cut T must not change anything the model decided before T."""
++    df = _series()
++    cut = 520
++    rng = np.random.default_rng(99)
++    df2 = df.copy()
++    for col in ("Open", "High", "Low", "Close"):
++        df2.iloc[cut:, df2.columns.get_loc(col)] = df2[col].iloc[cut:].to_numpy() * rng.uniform(0.7, 1.3, len(df2) - cut)
++    a = walk_forward("T.NS", df, step=10)
++    b = walk_forward("T.NS", df2, step=10)
++    before = a["date"] < df.index[cut - 1]
++    assert before.sum() >= 10
++    pd.testing.assert_frame_equal(
++        a.loc[before, ["date", "score", "zone", "setup", "invalidation", "target_1", "rr"]].reset_index(drop=True),
++        b.loc[before, ["date", "score", "zone", "setup", "invalidation", "target_1", "rr"]].reset_index(drop=True),
++    )
++
++
++def test_summarize_and_dedupe():
++    df = _series()
++    res = walk_forward("T.NS", df, step=10)
++    s = summarize(res, cooldown_bars=10, step=10)
++    assert s["samples"] == len(res)
++    assert set(s) >= {"baseline_all_dates", "by_zone", "by_setup", "by_score_bucket", "buy_signals_deduped"}
++    assert s["baseline_all_dates"]["edge_vs_all_20d"] == 0
++    # dedupe: 15 signals sampled every 3 bars with a 10-bar cooldown -> every 4th is kept (0,4,8,12)
++    dates = pd.bdate_range("2024-01-01", periods=15)
++    sig = pd.DataFrame({"ticker": ["A"] * 15, "date": dates})
++    assert list(dedupe_signals(sig, cooldown_bars=10, step=3).index) == [0, 4, 8, 12]
++    # cooldown is tracked per ticker
++    two = pd.concat([sig, sig.assign(ticker="B")], ignore_index=True)
++    assert len(dedupe_signals(two, cooldown_bars=10, step=3)) == 8
+diff --git a/tests/test_market_app.py b/tests/test_market_app.py
+new file mode 100644
+index 0000000..318872d
+--- /dev/null
++++ b/tests/test_market_app.py
+@@ -0,0 +1,93 @@
++import time
++
++import pandas as pd
++import pytest
++from fastapi.testclient import TestClient
++
++import market
++import store
++import synth
++
++
++@pytest.fixture(autouse=True)
++def clean_cache():
++    market.invalidate_cache()
++    yield
++    market.invalidate_cache()
++
++
++def _frame(n=300):
++    return synth.make_ohlcv(synth.uptrend_retest(seed=1), seed=1).iloc[:n]
++
++
++def test_failed_download_is_not_cached_for_15_minutes(monkeypatch):
++    calls = []
++
++    def fake(*a, **k):
++        calls.append(a[0])
++        raise RuntimeError("yahoo down")
++
++    monkeypatch.setattr(market.yf, "download", fake)
++    assert market.download_history("X.NS").empty
++    assert market.download_history("X.NS").empty  # within FAIL_TTL: served from the short cache
++    assert len(calls) == 1
++    # age the failure entry past FAIL_TTL -> retried (it used to stay cached for the full 15 min)
++    key = ("X.NS", "2y")
++    ts, payload = market._price_cache[key]
++    market._price_cache[key] = (ts - market.FAIL_TTL - 5, payload)
++    market.download_history("X.NS")
++    assert len(calls) == 2
++
++
++def test_good_download_is_cached(monkeypatch):
++    calls = []
++    monkeypatch.setattr(market.yf, "download", lambda *a, **k: calls.append(a[0]) or _frame())
++    market.download_history("Y.NS")
++    market.download_history("Y.NS")
++    assert len(calls) == 1
++
++
++def test_cache_is_keyed_by_period(monkeypatch):
++    seen = []
++    monkeypatch.setattr(market.yf, "download", lambda t, period=None, **k: seen.append(period) or _frame())
++    market.download_history("Z.NS", period="2y")
++    market.download_history("Z.NS", period="5y")
++    assert seen == ["2y", "5y"]
++
++
++@pytest.mark.parametrize("ticker,bench", [("RELIANCE.NS", "^NSEI"), ("AAPL", "^GSPC"), ("VOD.L", "^FTSE")])
++def test_benchmark_follows_the_exchange(monkeypatch, ticker, bench):
++    asked = []
++    monkeypatch.setattr(market, "download_history", lambda t, period="2y": asked.append(t) or _frame())
++    assert market.get_benchmark(ticker) is not None
++    assert asked == [bench]
++
++
++def test_analyze_ticker_end_to_end_offline(monkeypatch):
++    monkeypatch.setattr(market.yf, "download", lambda *a, **k: _frame())
++    monkeypatch.setattr(market, "fetch_info", lambda t: ({"shortName": "Test Co", "sector": "Tech"}, None))
++    out = market.analyze_ticker("TESTCO")
++    assert out.get("error") is None, out
++    assert out["ticker"] == "TESTCO.NS" and out["name"] == "Test Co"
++    assert out["benchmark"]["symbol"] == "^NSEI"
++
++
++@pytest.fixture
++def client(monkeypatch, tmp_path):
++    monkeypatch.setattr(store, "DB_PATH", tmp_path / "w.db")
++    import app as app_module
++
++    return TestClient(app_module.app)
++
++
++def test_api_watchlist_snapshot_and_backtest_validation(client, monkeypatch):
++    monkeypatch.setattr(market.yf, "download", lambda *a, **k: _frame())
++    monkeypatch.setattr(market, "fetch_info", lambda t: ({}, None))
++    assert client.get("/api/watchlist").json() == {"tickers": []}
++    r = client.post("/api/watchlist", json={"ticker": "abc"})
++    assert r.status_code == 200 and r.json()["snapshot"]["ticker"] == "ABC.NS"
++    snap = client.get("/api/snapshot").json()
++    assert snap["count"] == 1 and snap["stocks"][0]["zones"] is not None
++    assert client.get("/api/backtest/ABC?period=1d").status_code == 400
++    assert client.get("/api/backtest/ABC?step=0").status_code == 400
++    assert client.delete("/api/watchlist/ABC.NS").json() == {"ok": True}
+diff --git a/tests/test_zones.py b/tests/test_zones.py
+new file mode 100644
+index 0000000..9e825dd
+--- /dev/null
++++ b/tests/test_zones.py
+@@ -0,0 +1,102 @@
++import numpy as np
++import pandas as pd
++
++import synth
++from analysis import add_indicators
++from zones import (
++    atr_last,
++    breakout_retest,
++    candle_signals,
++    find_zones,
++    pivot_idx,
++    recent_breakdown,
++    zigzag,
++)
++
++
++def _prep(px, **kw):
++    return add_indicators(synth.make_ohlcv(px, **kw))
++
++
++def test_pivot_plateau_yields_single_pivot():
++    s = pd.Series([5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 7, 8], dtype=float)
++    idx = pivot_idx(s, order=3, mode="low")
++    assert list(idx) == [4]  # the two equal lows collapse to the first bar
++
++
++def test_planted_support_and_resistance_found_with_multiple_touches():
++    df = _prep(synth.range_with_levels(n=400))
++    zones = find_zones(df)
++    sup = [z for z in zones if abs(z["mid"] - 91) <= 2]
++    res = [z for z in zones if abs(z["mid"] - 109) <= 2]
++    assert sup and res
++    assert max(z["touches"] for z in sup) >= 3
++    assert max(z["touches"] for z in res) >= 3
++    assert max(z["strength"] for z in sup) >= 60
++
++
++def test_zone_width_scales_with_atr():
++    calm = _prep(synth.range_with_levels(n=400), wick=0.002)
++    wild = _prep(synth.range_with_levels(n=400), wick=0.02)
++    w = lambda d: np.mean([z["high"] - z["low"] for z in find_zones(d)])
++    assert w(wild) > w(calm)
++
++
++def test_steep_one_way_move_does_not_create_noise_zones():
++    # Straight decline with tiny noise: the reaction filter should leave (almost) no zones.
++    df = _prep(synth.piecewise([(0, 200), (200, 100)], noise=0.002, seed=3))
++    strong = [z for z in find_zones(df) if z["touches"] >= 2]
++    assert len(strong) <= 1
++
++
++def test_zigzag_is_causal():
++    """Pivots found on a prefix must be exactly the first pivots found on the full series."""
++    df = _prep(synth.uptrend_retest(seed=2), seed=2)
++    args = lambda d: [d[c].to_numpy(float) for c in ("High", "Low", "Close", "ATR")]
++    full = zigzag(*args(df))
++    for cut in (150, 220, 280):
++        part = zigzag(*args(df.iloc[:cut]))
++        assert part == full[: len(part)]
++
++
++def test_indicators_have_no_lookahead():
++    df = synth.make_ohlcv(synth.uptrend_retest(seed=1), seed=1)
++    full = add_indicators(df)
++    for cut in (120, 200, 250):
++        part = add_indicators(df.iloc[:cut])
++        for col in ("SMA20", "SMA200", "RSI", "ATR", "ADX", "MACD_hist", "CMF", "Rel_Vol", "BB_pct", "STOCH_K"):
++            a, b = part[col].iloc[-1], full[col].iloc[cut - 1]
++            assert (np.isnan(a) and np.isnan(b)) or abs(a - b) < 1e-9, (col, cut)
++
++
++def test_breakout_retest_detected_on_planted_pattern():
++    df = _prep(synth.uptrend_retest(seed=1), seed=1)
++    r = breakout_retest(df, find_zones(df), atr_last(df))
++    assert r is not None
++    assert 158 <= r["zone"]["low"] <= 163 and r["bars_ago"] <= 30
++
++
++def test_recent_breakdown_detected_when_tested_support_fails():
++    px = np.concatenate([synth.range_with_levels(n=300), np.linspace(91, 80, 14)])
++    df = _prep(px)
++    z = recent_breakdown(df, find_zones(df), atr_last(df))
++    assert z is not None and z["touches"] >= 3
++
++
++def test_no_breakdown_inside_a_healthy_range():
++    df = _prep(synth.range_with_levels(n=300))
++    assert recent_breakdown(df, find_zones(df), atr_last(df)) is None
++
++
++def test_candle_rejection_and_reclaim():
++    zone = {"low": 99.0, "high": 101.0}
++    base = dict(
++        Open=[103, 102, 101.5], High=[104, 103, 102.0], Low=[102, 100.5, 96.5], Close=[102.5, 101.2, 101.4],
++        Volume=[1e6] * 3,
++    )
++    df = pd.DataFrame(base, index=pd.bdate_range("2024-01-01", periods=3))
++    df = pd.concat([df] * 2).iloc[-4:]  # >= 4 rows
++    df.index = pd.bdate_range("2024-01-01", periods=len(df))
++    c = candle_signals(df, zone, atr=1.5)
++    assert c["rejection"] and c["reclaim"] and not c["close_below_zone"]
++    assert not any(candle_signals(df, None, 1.5).values())
+diff --git a/zones.py b/zones.py
+new file mode 100644
+index 0000000..0ac71a1
+--- /dev/null
++++ b/zones.py
+@@ -0,0 +1,340 @@
++#!/usr/bin/env python3
++"""Support/resistance zone engine, ATR-scaled swing detection and candle checks.
++
++Pure functions over OHLCV frames (no network, no globals), so they can be
++unit-tested and replayed bar-by-bar in the backtester without lookahead.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Optional
++
++import numpy as np
++import pandas as pd
++
++PIVOT_ORDER = 3  # bars either side to confirm a fractal swing point
++ZONE_LOOKBACK = 320  # bars of history used to build zones
++RECENCY_HALF_LIFE = 120  # a touch loses half its weight every 120 bars
++MIN_TOUCH_GAP = 5  # pivots closer than this are the same "touch event"
++REACTION_ATR = 1.5  # a touch must be followed by a reversal this many ATRs...
++REACTION_BARS = 10  # ...within this many bars
++MIN_ZONE_AGE = 15  # a zone must pre-date a break/retest by this many bars
++ZIGZAG_ATR_MULT = 2.5  # a swing must retrace this many ATRs to be confirmed
++ZIGZAG_MIN_PCT = 0.03  # ...and at least this fraction of price
++
++
++# --------------------------------------------------------------------------
++# Fractal pivots
++# --------------------------------------------------------------------------
++def _dedupe(idx: np.ndarray, gap: int) -> np.ndarray:
++    keep: list[int] = []
++    for i in idx:
++        if keep and int(i) - keep[-1] <= gap:
++            continue  # plateau tie: same extreme value, keep the first bar
++        keep.append(int(i))
++    return np.array(keep, dtype=int)
++
++
++def pivot_idx(series: pd.Series, order: int = PIVOT_ORDER, mode: str = "low") -> np.ndarray:
++    """Positional indices of confirmed fractal swing lows/highs.
++
++    The centred window is NaN for the last `order` bars, so unconfirmed pivots
++    at the right edge are excluded. Equal-value plateaus yield one pivot.
++    """
++    win = 2 * order + 1
++    roll = series.rolling(win, center=True)
++    ext = roll.min() if mode == "low" else roll.max()
++    mask = ((series == ext) & ext.notna()).to_numpy()
++    return _dedupe(np.flatnonzero(mask), order)
++
++
++def atr_last(df: pd.DataFrame) -> float:
++    if "ATR" in df.columns:
++        v = df["ATR"].iloc[-1]
++        if np.isfinite(v) and v > 0:
++            return float(v)
++    h, l, c = df["High"], df["Low"], df["Close"]
++    tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
++    v = tr.tail(14).mean()
++    if np.isfinite(v) and v > 0:
++        return float(v)
++    return float(c.iloc[-1]) * 0.02
++
++
++# --------------------------------------------------------------------------
++# ATR zig-zag (significant swings only)
++# --------------------------------------------------------------------------
++def zigzag(
++    high: np.ndarray,
++    low: np.ndarray,
++    close: np.ndarray,
++    atr: np.ndarray,
++    mult: float = ZIGZAG_ATR_MULT,
++    min_pct: float = ZIGZAG_MIN_PCT,
++) -> list[dict[str, Any]]:
++    """Confirmed swing highs/lows. A pivot is confirmed only after price has
++    reversed by max(mult*ATR, min_pct*price) from the extreme, so the newest
++    pivot is never based on future bars."""
++    n = len(high)
++    piv: list[dict[str, Any]] = []
++    if n < 5:
++        return piv
++
++    def thr(i: int) -> float:
++        a = atr[i] if np.isfinite(atr[i]) else 0.0
++        return max(mult * a, min_pct * close[i])
++
++    direction = 0  # 1 = up-leg, -1 = down-leg, 0 = undecided
++    hi_p, hi_i = high[0], 0
++    lo_p, lo_i = low[0], 0
++    for i in range(1, n):
++        t = thr(i)
++        if direction == 0:
++            if high[i] > hi_p:
++                hi_p, hi_i = high[i], i
++            if low[i] < lo_p:
++                lo_p, lo_i = low[i], i
++            if hi_p - low[i] >= t and hi_i < i and hi_i != lo_i:
++                piv.append({"i": hi_i, "p": float(hi_p), "t": "H"})
++                direction, lo_p, lo_i = -1, low[i], i
++            elif high[i] - lo_p >= t and lo_i < i and hi_i != lo_i:
++                piv.append({"i": lo_i, "p": float(lo_p), "t": "L"})
++                direction, hi_p, hi_i = 1, high[i], i
++        elif direction == 1:
++            if high[i] > hi_p:
++                hi_p, hi_i = high[i], i
++            elif hi_p - low[i] >= t:
++                piv.append({"i": hi_i, "p": float(hi_p), "t": "H"})
++                direction, lo_p, lo_i = -1, low[i], i
++        else:
++            if low[i] < lo_p:
++                lo_p, lo_i = low[i], i
++            elif high[i] - lo_p >= t:
++                piv.append({"i": lo_i, "p": float(lo_p), "t": "L"})
++                direction, hi_p, hi_i = 1, high[i], i
++    return piv
++
++
++# --------------------------------------------------------------------------
++# Zones
++# --------------------------------------------------------------------------
++def find_zones(df: pd.DataFrame, lookback: int = ZONE_LOOKBACK, order: int = PIVOT_ORDER) -> list[dict[str, Any]]:
++    """Cluster swing highs AND lows into price zones (a level that was
++    resistance can become support, so both feed the same clusters).
++
++    Zone width and clustering tolerance scale with ATR. Strength rewards
++    repeated, recent, volume-backed touches and role reversal; it penalises
++    levels that price has sliced through many times (chop).
++    """
++    n = len(df)
++    if n < 40:
++        return []
++    price = float(df["Close"].iloc[-1])
++    atr = atr_last(df)
++    start = max(0, n - lookback)
++    high, low = df["High"], df["Low"]
++    closes = df["Close"].to_numpy(dtype=float)
++    vol = df["Volume"].to_numpy(dtype=float)
++    vol_base = pd.Series(vol).rolling(50, min_periods=10).median().to_numpy()
++
++    hi_arr = high.to_numpy(dtype=float)
++    lo_arr = low.to_numpy(dtype=float)
++    atr_arr = df["ATR"].to_numpy(dtype=float) if "ATR" in df.columns else np.full(n, atr)
++
++    seeds: list[tuple[float, int, str, float]] = []
++    for kind, ser, mode in (("H", high, "high"), ("L", low, "low")):
++        for i in pivot_idx(ser, order, mode):
++            if i < start:
++                continue
++            # Reaction filter: a "touch" only counts if price actually reversed
++            # >= REACTION_ATR ATRs within the next REACTION_BARS bars. This drops
++            # the meaningless fractals that litter a steep one-way move.
++            a_i = atr_arr[i] if np.isfinite(atr_arr[i]) and atr_arr[i] > 0 else atr
++            fwd = slice(i + 1, min(n, i + 1 + REACTION_BARS))
++            if fwd.start >= n:
++                continue
++            if kind == "L":
++                reaction = hi_arr[fwd].max() - lo_arr[i]
++            else:
++                reaction = hi_arr[i] - lo_arr[fwd].min()
++            if reaction < REACTION_ATR * a_i:
++                continue
++            vb = vol_base[i]
++            if np.isfinite(vb) and vb > 0:
++                vr = float(vol[max(0, i - 1) : i + 2].mean() / vb)
++            else:
++                vr = 1.0
++            seeds.append((float(ser.iloc[i]), int(i), kind, float(min(max(vr, 0.3), 3.0))))
++    if not seeds:
++        return []
++
++    seeds.sort(key=lambda s: s[0])
++    tol = float(np.clip(0.55 * atr, 0.004 * price, 0.03 * price))
++    clusters: list[list[tuple[float, int, str, float]]] = []
++    cur = [seeds[0]]
++    for s in seeds[1:]:
++        if s[0] - cur[-1][0] <= tol and s[0] - cur[0][0] <= 2.2 * tol:
++            cur.append(s)
++        else:
++            clusters.append(cur)
++            cur = [s]
++    clusters.append(cur)
++
++    zones: list[dict[str, Any]] = []
++    for cl in clusters:
++        prices = np.array([s[0] for s in cl])
++        idxs = np.sort(np.array([s[1] for s in cl]))
++        lo, hi = float(prices.min()), float(prices.max())
++        min_w = 0.3 * atr
++        if hi - lo < min_w:
++            c = (hi + lo) / 2
++            lo, hi = c - min_w / 2, c + min_w / 2
++        else:
++            lo, hi = lo - 0.08 * atr, hi + 0.08 * atr
++
++        touches = 1 + int((np.diff(idxs) >= MIN_TOUCH_GAP).sum())
++        first, last_i = int(idxs[0]), int(idxs[-1])
++        w = np.array([0.5 ** ((n - 1 - s[1]) / RECENCY_HALF_LIFE) for s in cl])
++        mid = float(np.average(prices, weights=w + 1e-9))
++        mid = min(max(mid, lo), hi)
++
++        # How often did closes pass fully through the zone after it formed?
++        seg = closes[first:]
++        state = np.zeros(len(seg), dtype=int)
++        state[seg > hi + 0.25 * atr] = 1
++        state[seg < lo - 0.25 * atr] = -1
++        nz = state[state != 0]
++        flips = int((np.diff(nz) != 0).sum()) if len(nz) > 1 else 0
++
++        vol_avg = float(np.mean([s[3] for s in cl]))
++        recency = float(0.5 ** ((n - 1 - last_i) / RECENCY_HALF_LIFE))
++        vol_bonus = float(np.clip(10 * (min(vol_avg, 2.0) - 1.0), -4, 10))
++        flip_bonus = 10.0 if 1 <= flips <= 3 else (-12.0 if flips >= 4 else 0.0)
++        strength = float(np.clip(18 * min(touches, 5) + 20 * recency + vol_bonus + flip_bonus, 0, 100))
++
++        role = "support" if price > hi else ("resistance" if price < lo else "inside")
++        zones.append(
++            {
++                "low": round(lo, 2),
++                "high": round(hi, 2),
++                "mid": round(mid, 2),
++                "touches": touches,
++                "strength": int(round(strength)),
++                "flips": flips,
++                "age": n - 1 - first,
++                "last_touch_age": n - 1 - last_i,
++                "role": role,
++            }
++        )
++    zones.sort(key=lambda z: z["mid"])
++    return zones
++
++
++def pick_support(zones: list[dict], price: float, atr: float, max_atr: float = 12.0) -> Optional[dict]:
++    """Best demand zone at/below price: strong beats weak, near beats far
++    (9 strength points per ATR of distance)."""
++    best, best_sc = None, -1e9
++    for z in zones:
++        if z["low"] >= price:
++            continue
++        gap = max(0.0, price - z["high"]) / atr
++        if gap > max_atr:
++            continue
++        sc = z["strength"] - 9.0 * gap
++        if sc > best_sc:
++            best, best_sc = z, sc
++    return best
++
++
++def pick_resistances(zones: list[dict], price: float, atr: float) -> list[dict]:
++    """Supply zones overhead, nearest first. Weak one-touch zones are skipped
++    unless nothing stronger exists."""
++    above = sorted((z for z in zones if z["mid"] > price + 0.15 * atr), key=lambda z: z["mid"])
++    strong = [z for z in above if z["strength"] >= 30]
++    return strong or above
++
++
++def recent_breakdown(df: pd.DataFrame, zones: list[dict], atr: float, bars: int = 12) -> Optional[dict]:
++    """A meaningful zone that closes were above within `bars` and are now
++    decisively below: support has failed and should not be bought."""
++    if len(df) < bars + 2:
++        return None
++    closes = df["Close"].to_numpy(dtype=float)
++    best = None
++    for z in zones:
++        # Must be a level that was tested before (not one the fall itself created).
++        if z["strength"] < 35 or z["touches"] < 2 or z["age"] < MIN_ZONE_AGE + bars:
++            continue
++        if closes[-1] < z["low"] - 0.25 * atr and (closes[-bars - 1 : -1] > z["high"]).any():
++            if best is None or z["strength"] > best["strength"]:
++                best = z
++    return best
++
++
++def breakout_retest(df: pd.DataFrame, zones: list[dict], atr: float, max_age: int = 30) -> Optional[dict]:
++    """Price broke above a zone on real volume and is now pulling back to test
++    it from above (old resistance turned support)."""
++    n = len(df)
++    if n < max_age + 5:
++        return None
++    closes = df["Close"].to_numpy(dtype=float)
++    highs = df["High"].to_numpy(dtype=float)
++    vol = df["Volume"].to_numpy(dtype=float)
++    vbase = pd.Series(vol).rolling(20).mean().shift(1).to_numpy()
++    price = closes[-1]
++    best = None
++    for z in zones:
++        if z["strength"] < 35 or price <= z["high"] - 0.25 * atr:
++            continue
++        above = closes > z["high"] + 0.25 * atr
++        crosses = np.flatnonzero(above[1:] & ~above[:-1]) + 1
++        crosses = crosses[crosses >= n - max_age]
++        if not len(crosses):
++            continue
++        j = int(crosses[-1])
++        if (n - 1 - z["age"]) > j - MIN_ZONE_AGE:
++            continue  # the zone must have existed before the breakout
++        if (closes[j:] < z["low"] - 0.25 * atr).any():
++            continue
++        if highs[j:].max() < z["high"] + 0.8 * atr:
++            continue  # never really left the zone
++        if not (z["high"] - 0.25 * atr <= price <= z["high"] + 1.2 * atr):
++            continue
++        seg = slice(j, min(j + 2, n))
++        base = vbase[seg]
++        ok = np.isfinite(base) & (base > 0)
++        vol_confirm = bool(ok.any() and (vol[seg][ok] / base[ok]).max() >= 1.25)
++        cand = {"zone": z, "bars_ago": n - 1 - j, "vol_confirm": vol_confirm}
++        if best is None or z["strength"] > best["zone"]["strength"]:
++            best = cand
++    return best
++
++
++# --------------------------------------------------------------------------
++# Candle confirmation
++# --------------------------------------------------------------------------
++def candle_signals(df: pd.DataFrame, zone: Optional[dict], atr: float) -> dict[str, bool]:
++    out = {"rejection": False, "engulfing": False, "reclaim": False, "close_below_zone": False}
++    if zone is None or len(df) < 4:
++        return out
++    o = df["Open"].to_numpy(dtype=float)[-3:]
++    h = df["High"].to_numpy(dtype=float)[-3:]
++    l = df["Low"].to_numpy(dtype=float)[-3:]
++    c = df["Close"].to_numpy(dtype=float)[-3:]
++
++    def hammer(i: int) -> bool:
++        rng = h[i] - l[i]
++        if rng <= 0:
++            return False
++        body = abs(c[i] - o[i])
++        lower = min(o[i], c[i]) - l[i]
++        return bool(lower >= 0.5 * rng and lower >= 1.5 * body and (c[i] - l[i]) >= 0.6 * rng)
++
++    touched = min(l[-2:]) <= zone["high"] + 0.25 * atr
++    out["rejection"] = bool(touched and (hammer(-1) or (hammer(-2) and c[-1] >= c[-2])))
++    out["engulfing"] = bool(
++        touched and c[-2] < o[-2] and c[-1] > o[-1] and c[-1] >= o[-2] and o[-1] <= c[-2]
++    )
++    out["reclaim"] = bool(min(l) < zone["low"] - 0.1 * atr and c[-1] > zone["low"] and c[-1] >= c[-2])
++    out["close_below_zone"] = bool(c[-1] < zone["low"] - 0.5 * atr)
++    return out
+-- 
+2.43.0
+
