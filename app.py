@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import store
+from backtest import run_ticker
 from market import analyze_ticker, invalidate_cache, resolve_listed_ticker
 
 ROOT = Path(__file__).resolve().parent
@@ -95,6 +96,21 @@ def stock_detail(ticker: str):
 def refresh():
     invalidate_cache()
     return snapshot()
+
+
+@app.get("/api/backtest/{ticker}")
+def backtest_ticker(ticker: str, period: str = "5y", step: int = 3):
+    """Walk-forward test of the score on one ticker: forward returns, stop and
+    target hit rates by zone/setup. Slow (runs the analysis on every sampled
+    date), so use a coarse step for a first look."""
+    if period not in {"3y", "5y", "7y", "10y", "max"}:
+        raise HTTPException(400, "period must be one of 3y, 5y, 7y, 10y, max")
+    if not 1 <= step <= 20:
+        raise HTTPException(400, "step must be between 1 and 20")
+    try:
+        return run_ticker(ticker, period=period, step=step)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 if __name__ == "__main__":

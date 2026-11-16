@@ -104,12 +104,22 @@ function renderDetail(s) {
   $("d-zone").textContent = ZONE_LABEL[s.zone] || s.zone;
   const inv = s.invalidation ? `Invalidate below <strong>${fmt(s.invalidation)}</strong>` : "";
   const inBand = s.in_buy_band ? "Price is inside the band." : "Price is outside the band.";
+  const tg = s.targets || {};
+  const tgt = tg.target_1
+    ? `Target <strong>${fmt(tg.target_1)}</strong>${tg.target_2 ? ` → ${fmt(tg.target_2)}` : ""}${tg.source === "projected" ? " (projected, no overhead zone)" : ""}`
+    : "";
+  const rr = s.risk_reward != null ? `Reward:risk <strong>${fmt(s.risk_reward, 1)}</strong>` : "";
+  const sizing = s.size_pct_for_1pct_risk
+    ? `Stop is ${fmt(s.risk_pct, 1)}% away: ~${fmt(s.size_pct_for_1pct_risk, 0)}% of capital risks 1%`
+    : "";
   $("d-band").innerHTML = s.buy_from
-    ? `Buy band <strong>${fmt(s.buy_from)} – ${fmt(s.buy_to)}</strong><br>${inBand}<br>${inv}`
-    : "No reliable support band yet.";
+    ? [`Buy band <strong>${fmt(s.buy_from)} – ${fmt(s.buy_to)}</strong>`, inBand, inv, tgt, rr, sizing]
+        .filter(Boolean)
+        .join("<br>")
+    : "No reliable demand zone to define an entry yet.";
   $("d-signals").innerHTML = (s.signals || []).map((x) => `<li>${x}</li>`).join("");
   const scores = s.scores || {};
-  $("d-bars").innerHTML = ["location", "momentum", "trend", "volume"]
+  $("d-bars").innerHTML = ["location", "momentum", "trend", "volume", "risk"]
     .map(
       (k) => `<div>
         <div class="bar-lbl"><span>${k}</span><span>${scores[k] ?? "—"}</span></div>
@@ -119,13 +129,18 @@ function renderDetail(s) {
     .join("");
   const t = s.technicals || {};
   const f = s.fundamentals || {};
+  const bn = (s.benchmark && s.benchmark.name) || "index";
   const rows = [
     ["RSI (14)", fmt(t.rsi, 1)],
     ["ADX", fmt(t.adx, 1)],
     ["+DI / −DI", `${fmt(t.plus_di, 1)} / ${fmt(t.minus_di, 1)}`],
     ["Rel volume", fmt(t.rel_vol, 2) + "x"],
     ["CMF", fmt(t.cmf, 3)],
-    ["20d vs Nifty", (t.rs_20 > 0 ? "+" : "") + fmt(t.rs_20, 2)],
+    [`20d vs ${bn}`, t.rs_20 == null ? "—" : (t.rs_20 > 0 ? "+" : "") + fmt(t.rs_20, 2)],
+    [`60d vs ${bn}`, t.rs_60 == null ? "—" : (t.rs_60 > 0 ? "+" : "") + fmt(t.rs_60, 2)],
+    ["Weekly trend", (s.weekly && s.weekly.trend) || "—"],
+    [`${bn} regime`, (s.regime && s.regime.state) || "—"],
+    ["Liquidity", (s.liquidity && s.liquidity.state) || "—"],
     ["60d drawdown", fmt(t.dd_60, 1) + "%"],
     ["52w position", t.pos_52w != null ? fmt(t.pos_52w, 1) + "%" : "—"],
     ["SMA 20 / dist", `${fmt(t.sma20)}  (${fmt(t.dist_sma20)}%)`],
@@ -140,7 +155,7 @@ function renderDetail(s) {
   $("d-tech").innerHTML = rows
     .map(([a, b]) => `<div><span>${a}</span><b>${b}</b></div>`)
     .join("");
-  drawChart(s.chart || {});
+  drawChart(s.chart || {}, s);
 }
 
 function linePath(values, w, h, padT, padB, scaleMin, scaleMax) {
@@ -162,7 +177,35 @@ function linePath(values, w, h, padT, padB, scaleMin, scaleMax) {
   return { d, min, max };
 }
 
-function drawChart(chart) {
+function zoneRects(chart, s, w, h, pMin, pMax) {
+  const span = pMax - pMin || 1;
+  const y = (v) => 12 + (1 - (Math.min(Math.max(v, pMin), pMax) - pMin) / span) * (h - 12 - 36);
+  const rect = (lo, hi, fill, stroke) => {
+    if (hi < pMin || lo > pMax) return "";
+    const y1 = y(hi);
+    const y2 = y(lo);
+    return `<rect x="0" y="${y1.toFixed(1)}" width="${w}" height="${Math.max(y2 - y1, 1.5).toFixed(1)}" fill="${fill}" stroke="${stroke}" stroke-width="0.6"/>`;
+  };
+  let out = "";
+  (chart.zones || []).forEach((z) => {
+    out += z.role === "support"
+      ? rect(z.low, z.high, "rgba(111,191,115,0.10)", "rgba(111,191,115,0.35)")
+      : rect(z.low, z.high, "rgba(205,102,95,0.10)", "rgba(205,102,95,0.35)");
+  });
+  if (s && s.buy_from && s.buy_to) out += rect(s.buy_from, s.buy_to, "rgba(196,163,90,0.18)", "rgba(196,163,90,0.7)");
+  if (s && s.invalidation && s.invalidation >= pMin) {
+    const yy = y(s.invalidation).toFixed(1);
+    out += `<line x1="0" y1="${yy}" x2="${w}" y2="${yy}" stroke="#cd665f" stroke-dasharray="4 3" stroke-width="0.8"/>`;
+  }
+  const t1 = s && s.targets && s.targets.target_1;
+  if (t1 && t1 <= pMax) {
+    const yy = y(t1).toFixed(1);
+    out += `<line x1="0" y1="${yy}" x2="${w}" y2="${yy}" stroke="#6fbf73" stroke-dasharray="4 3" stroke-width="0.8"/>`;
+  }
+  return out;
+}
+
+function drawChart(chart, s) {
   const svg = $("chart");
   const rsiSvg = $("rsi-chart");
   const close = chart.close || [];
@@ -176,13 +219,14 @@ function drawChart(chart) {
   const all = close.concat(chart.sma20 || [], chart.sma50 || [], chart.sma200 || []).filter((v) => v != null);
   const pMin = Math.min(...all);
   const pMax = Math.max(...all);
+  const zonesSvg = zoneRects(chart, s, w, h, pMin, pMax);
   const price = linePath(close, w, h, 12, 36, pMin, pMax);
   const s20 = linePath(chart.sma20 || [], w, h, 12, 36, pMin, pMax);
   const s50 = linePath(chart.sma50 || [], w, h, 12, 36, pMin, pMax);
   const s200 = linePath(chart.sma200 || [], w, h, 12, 36, pMin, pMax);
   const last = close.filter((v) => v != null).pop();
   svg.innerHTML = `
-    <polyline fill="none" stroke="#8b9088" stroke-width="1.2" points="" />
+    ${zonesSvg}
     <path d="${price.d}" fill="none" stroke="#e8e6df" stroke-width="1.6"/>
     <path d="${s20.d}" fill="none" stroke="#c4a35a" stroke-width="1"/>
     <path d="${s50.d}" fill="none" stroke="#6f9fbf" stroke-width="1"/>

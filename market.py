@@ -10,21 +10,23 @@ from typing import Any, Optional
 import pandas as pd
 import yfinance as yf
 
-_YF_LOCK = threading.Lock()
-
 from analysis import (
-    BENCHMARK,
     analyze_frame,
     clean_ohlcv,
     empty_error,
     nse_candidate,
     resolve_ticker,
 )
+from context import benchmark_for
+
+_YF_LOCK = threading.Lock()
 
 CACHE_TTL = 15 * 60
-_price_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+FAIL_TTL = 60  # an empty/failed download is retried after a minute, not 15
+MIN_BARS_LISTED = 80
+
+_price_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
 _info_cache: dict[str, tuple[float, dict]] = {}
-_bench_cache: tuple[float, Optional[pd.DataFrame]] | None = None
 
 
 def _fresh(entry, ttl=CACHE_TTL):
@@ -36,19 +38,28 @@ def _fresh(entry, ttl=CACHE_TTL):
     return payload
 
 
+def _stamp(ok: bool, ttl: int = CACHE_TTL) -> float:
+    """Timestamp that makes an entry expire after FAIL_TTL when it is a failure."""
+    return time.time() if ok else time.time() - (ttl - FAIL_TTL)
+
+
 def download_history(ticker: str, period: str = "2y") -> pd.DataFrame:
-    cached = _fresh(_price_cache.get(ticker))
+    key = (ticker, period)
+    cached = _fresh(_price_cache.get(key))
     if cached is not None:
         return cached.copy()
     with _YF_LOCK:
-        cached = _fresh(_price_cache.get(ticker))
+        cached = _fresh(_price_cache.get(key))
         if cached is not None:
             return cached.copy()
-        df = yf.download(
-            ticker, period=period, progress=False, auto_adjust=True, threads=False
-        )
-        df = clean_ohlcv(df)
-        _price_cache[ticker] = (time.time(), df)
+        try:
+            raw = yf.download(
+                ticker, period=period, progress=False, auto_adjust=True, threads=False
+            )
+            df = clean_ohlcv(raw, ticker=ticker)
+        except Exception:
+            df = pd.DataFrame()
+        _price_cache[key] = (_stamp(len(df) > 0), df)
         return df.copy()
 
 
@@ -71,18 +82,16 @@ def fetch_info(ticker: str) -> tuple[dict, Any]:
             calendar = t.calendar
         except Exception:
             calendar = None
-        _info_cache[ticker] = (time.time(), {"info": info, "calendar": calendar})
+        ok = bool(info)
+        _info_cache[ticker] = (_stamp(ok, 6 * 3600), {"info": info, "calendar": calendar})
         return info, calendar
 
 
-def get_benchmark() -> Optional[pd.DataFrame]:
-    global _bench_cache
-    cached = _fresh(_bench_cache) if _bench_cache else None
-    if cached is not None:
-        return cached
-    df = download_history(BENCHMARK, period="2y")
-    _bench_cache = (time.time(), df)
-    return df
+def get_benchmark(ticker: str, period: str = "2y") -> Optional[pd.DataFrame]:
+    """Index matched to the ticker's exchange (Nifty for .NS/.BO, S&P 500 for
+    US listings, ...). Relative strength vs the wrong index is meaningless."""
+    df = download_history(benchmark_for(ticker), period=period)
+    return df if len(df) else None
 
 
 def resolve_listed_ticker(raw: str) -> str:
@@ -90,16 +99,14 @@ def resolve_listed_ticker(raw: str) -> str:
     # Bare symbols in this project are usually NSE. Try .NS first, then the
     # raw Yahoo symbol (US / other listings). Explicit suffixes win as-is.
     candidates = [ticker] if "." in ticker else [nse_candidate(ticker), ticker]
-    seen = []
+    seen: list[str] = []
     for cand in candidates:
         if cand in seen:
             continue
         seen.append(cand)
         df = download_history(cand)
-        if len(df) >= 80:
+        if len(df) >= MIN_BARS_LISTED:
             return cand
-    if seen:
-        raise ValueError(f"No price history for {raw}")
     raise ValueError(f"No price history for {raw}")
 
 
@@ -113,18 +120,17 @@ def analyze_ticker(raw: str) -> dict[str, Any]:
         if df.empty:
             return empty_error(ticker, "No price data")
         info, calendar = fetch_info(ticker)
-        bench = get_benchmark()
+        bench = get_benchmark(ticker)
         return analyze_frame(ticker, df, bench=bench, info=info, calendar=calendar)
     except Exception as exc:
         return empty_error(ticker, f"{type(exc).__name__}: {exc}")
 
 
 def invalidate_cache(ticker: Optional[str] = None) -> None:
-    global _bench_cache
     if ticker:
-        _price_cache.pop(ticker, None)
+        for key in [k for k in _price_cache if k[0] == ticker]:
+            _price_cache.pop(key, None)
         _info_cache.pop(ticker, None)
     else:
         _price_cache.clear()
         _info_cache.clear()
-        _bench_cache = None
